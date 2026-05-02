@@ -13,8 +13,12 @@
   "_ai_queue_size_说明": "大模型消息队列长度。0 表示不限制；建议多群监听时保持 0 或设置为较大值，例如 100。队列会逐条调用大模型、逐条发送回复，不并发。",
   "ai_context_size": 8,
   "_ai_context_size_说明": "同一个群传给大模型的最近上下文消息数。上下文会带发送人，例如：张三说: 你好。",
+  "ai_max_reply_chars": 180,
+  "_ai_max_reply_chars_说明": "单条自动回复目标最大字符数。会写入模型提示词让模型自然控制长度，程序仅做极端兜底；建议 80-220，越短越像微信聊天。",
   "group_log_root": "logs/group_mentions",
   "_group_log_root_说明": "群聊 @ 自动回复审计日志目录。程序会按日期建子目录，并按群名单独写 log 文件。",
+  "error_log_root": "logs/errors",
+  "_error_log_root_说明": "关键错误日志目录。reply_failed、切群失败、AI 调用异常等会按日期写入这里。",
   "default": "ark",
   "_default_说明": "默认使用 providers 中的哪个模型服务配置。",
   "providers": {

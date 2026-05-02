@@ -118,12 +118,29 @@ def _load_ai_context_size(config: Dict[str, Any]) -> int:
     return value
 
 
+def _load_ai_max_reply_chars(config: Dict[str, Any]) -> int:
+    """读取单条 AI 回复最大字符数。"""
+    value = int(config.get("ai_max_reply_chars", 180))
+    if value < 20:
+        raise ValueError("ai_max_reply_chars 不能小于 20。")
+    return value
+
+
 def _configure_group_log_root(config: Dict[str, Any]) -> str:
     """配置按群 @ 审计日志目录。"""
     value = str(config.get("group_log_root", "logs/group_mentions")).strip()
     if not value:
         value = "logs/group_mentions"
     os.environ["WECHAT_GROUP_MENTION_LOG_ROOT"] = value
+    return value
+
+
+def _configure_error_log_root(config: Dict[str, Any]) -> str:
+    """配置关键错误日志目录。"""
+    value = str(config.get("error_log_root", "logs/errors")).strip()
+    if not value:
+        value = "logs/errors"
+    os.environ["WECHAT_ERROR_LOG_ROOT"] = value
     return value
 
 
@@ -141,7 +158,9 @@ def main() -> None:
             reply_delay_range = _load_reply_delay_range(raw_config)
             ai_queue_size = _load_ai_queue_size(raw_config)
             ai_context_size = _load_ai_context_size(raw_config)
+            ai_max_reply_chars = _load_ai_max_reply_chars(raw_config)
             group_log_root = _configure_group_log_root(raw_config)
+            error_log_root = _configure_error_log_root(raw_config)
 
             # AIConfig.from_file 会读取 providers/default，并支持环境变量覆盖。
             ai = AIClient(AIConfig.from_file(str(config_file)))
@@ -151,7 +170,9 @@ def main() -> None:
             print(f"回复随机延迟: {reply_delay_range[0]:.1f} - {reply_delay_range[1]:.1f} 秒")
             print(f"大模型消息队列: {'不限制' if ai_queue_size == 0 else ai_queue_size}")
             print(f"同群上下文长度: {ai_context_size}")
+            print(f"单条回复上限: {ai_max_reply_chars} 字")
             print(f"群聊审计日志: {group_log_root}")
+            print(f"关键错误日志: {error_log_root}")
             print(f"单实例锁: {_lock_path(config_file)}")
             print("启动中：只有被 @ 时才会调用大模型回复。按 Ctrl+C 停止。")
 
@@ -160,7 +181,12 @@ def main() -> None:
                     groups,
                     [
                         AsyncCallbackHandler(
-                            AIResponder(ai, context_size=ai_context_size, reply_on_at=True),
+                            AIResponder(
+                                ai,
+                                context_size=ai_context_size,
+                                reply_on_at=True,
+                                max_reply_chars=ai_max_reply_chars,
+                            ),
                             auto_reply=True,
                             reply_on_at=True,
                             queue_size=ai_queue_size,

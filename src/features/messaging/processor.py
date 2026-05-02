@@ -23,7 +23,7 @@ from collections import OrderedDict
 from typing import Callable, Iterable, List, Optional, Sequence, Union
 
 from .listener import MessageEvent, WeChatGroupListener
-from ...utils.logger import get_logger, log_group_mention_audit
+from ...utils.logger import get_logger, log_error_audit, log_group_mention_audit
 
 logger = get_logger(__name__)
 
@@ -41,6 +41,7 @@ class ReplyAction(MessageAction):
     content: str
     sender_nickname: str = ""
     original_content: str = ""
+    group_nickname: str = ""
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,7 @@ class CallbackHandler(MessageHandler):
             content=text,
             sender_nickname=event.sender_nickname or "",
             original_content=event.content or "",
+            group_nickname=event.group_nickname or "",
         )
 
     @staticmethod
@@ -287,6 +289,16 @@ class AsyncCallbackHandler(CallbackHandler):
                         self._emit_action(action)
             except Exception as exc:
                 logger.exception("异步消息处理失败: %s: %s", event.group, exc)
+                log_error_audit(
+                    "ai_callback_failed",
+                    {
+                        "group": event.group,
+                        "sender": event.sender_nickname or "",
+                        "message": event.content or "",
+                        "context_key": f"{event.group}|{event.group_nickname or ''}",
+                    },
+                    exc,
+                )
             finally:
                 self._jobs.task_done()
 
@@ -383,6 +395,15 @@ class WeChatGroupProcessor:
                 actions = handler.handle(event)
             except Exception as exc:
                 logger.exception(f"消息处理器执行失败: {event.group}: {exc}")
+                log_error_audit(
+                    "message_handler_failed",
+                    {
+                        "group": event.group,
+                        "sender": event.sender_nickname or "",
+                        "message": event.content or "",
+                    },
+                    exc,
+                )
                 continue
 
             for action in self._normalize_actions(actions):
@@ -413,6 +434,7 @@ class WeChatGroupProcessor:
                 self._execute_action(action)
             except Exception as exc:
                 logger.exception(f"消息动作执行失败: {exc}")
+                log_error_audit("message_action_failed", {"action_type": type(action).__name__}, exc)
             finally:
                 self._action_queue.task_done()
 
@@ -439,12 +461,23 @@ class WeChatGroupProcessor:
                     "event": "reply_sent" if sent else "reply_failed",
                     "sender": action.sender_nickname,
                     "message": action.original_content,
-                    "context_key": f"{action.group}|",
+                    "context_key": f"{action.group}|{action.group_nickname}",
                     "reply": text,
                 },
             )
         except Exception as exc:
             logger.debug("写入群聊回复审计日志失败: %s", exc)
+        if not sent:
+            log_error_audit(
+                "reply_failed",
+                {
+                    "group": action.group,
+                    "sender": action.sender_nickname,
+                    "message": action.original_content,
+                    "reply": text,
+                    "context_key": f"{action.group}|{action.group_nickname}",
+                },
+            )
 
     def _execute_forward(self, action: ForwardAction) -> None:
         text = (action.content or "").strip()

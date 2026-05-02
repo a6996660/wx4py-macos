@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """微信群聊监听与自动回复。
 
-该模块实现的是已经在诊断脚本中验证过的方案：
-1. 每个群聊打开一个独立聊天窗口。
-2. 每个窗口固定缓存 ``chat_message_list``。
-3. 使用单调度器按时间片分片轮询多个窗口。
+该模块按平台使用不同监听策略：
+1. Windows 端可以使用独立聊天窗口和 ``chat_message_list`` 轮询。
+2. macOS 端只监听左侧会话列表的 ``[有人@我]`` 预览，避免主窗口单聊天区在多群间串读。
+3. 自动回复统一进入串行发送队列，发送前再切换目标群。
 4. 自动回复时记录本库发送的消息，监听回流时只忽略一次。
 
 注意：
@@ -26,7 +26,7 @@ from typing import Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..chat import ChatWindow
 from ...platform import platform
-from ...utils.logger import get_logger
+from ...utils.logger import get_logger, log_error_audit
 
 logger = get_logger(__name__)
 
@@ -647,6 +647,7 @@ class WeChatGroupListener:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._sender_thread: Optional[threading.Thread] = None
+        self._current_send_group: Optional[str] = None
 
     @property
     def is_running(self) -> bool:
@@ -1129,18 +1130,32 @@ class WeChatGroupListener:
                 self.reply(task.group, task.content)
             except Exception as exc:
                 logger.exception(f"发送队列回复失败: {task.group}: {exc}")
+                log_error_audit(
+                    "reply_queue_failed",
+                    {"group": task.group, "reply": task.content},
+                    exc,
+                )
             finally:
                 self._reply_queue.task_done()
 
     def _send_in_subwindow(self, session: _ListenSession, content: str) -> bool:
         if platform.platform_name == "darwin":
-            if not self._activate_group_for_send(session):
-                return False
+            if self._current_send_group == session.group:
+                session.root = platform.automation.control_from_handle(self.client.window.hwnd)
+                if not self._find_chat_input(session.root):
+                    self._current_send_group = None
+            if self._current_send_group != session.group:
+                if not self._activate_group_for_send(session):
+                    return False
 
         root = session.root
         edit = self._find_chat_input(root)
         if not edit:
             logger.error(f"未找到聊天输入框: {session.group}")
+            log_error_audit(
+                "chat_input_missing",
+                {"group": session.group, "reply": content},
+            )
             return False
 
         sent = ChatWindow.send_text_via_input(
@@ -1152,7 +1167,14 @@ class WeChatGroupListener:
         )
         if platform.platform_name == "darwin" and _dismiss_send_failure_dialog(session.root):
             logger.error(f"微信提示发送失败: {session.group}")
+            self._current_send_group = None
+            log_error_audit(
+                "wechat_send_failure_dialog",
+                {"group": session.group, "reply": content},
+            )
             return False
+        if sent:
+            self._current_send_group = session.group
         return sent
 
     def _activate_group_for_send(self, session: _ListenSession) -> bool:
@@ -1193,12 +1215,17 @@ class WeChatGroupListener:
                         if msg_list:
                             session.msg_list = msg_list
                         if msg_list and edit:
+                            self._current_send_group = session.group
                             return True
                         last_reason = f"msg_list={bool(msg_list)}, edit={bool(edit)}"
                 except Exception as exc:
                     last_reason = f"attempt_failed:{exc}"
                     continue
         logger.error(f"发送前切换目标群失败: {session.group}, reason={last_reason}")
+        log_error_audit(
+            "activate_group_failed",
+            {"group": session.group, "reason": last_reason},
+        )
         return False
 
     @staticmethod

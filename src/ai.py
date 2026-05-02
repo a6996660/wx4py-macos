@@ -356,10 +356,12 @@ class AIResponder:
         *,
         context_size: int = 8,
         reply_on_at: bool = True,
+        max_reply_chars: int = 180,
     ):
         self.client = client
         self.context_size = context_size
         self.reply_on_at = reply_on_at
+        self.max_reply_chars = max(20, int(max_reply_chars))
         self.contexts: Dict[str, List[dict]] = {}
 
     def __call__(self, event: MessageEvent) -> str:
@@ -376,8 +378,12 @@ class AIResponder:
         context.append({"role": "user", "content": self._format_user_content(event, raw_content)})
         del context[:-self.context_size]
 
-        messages = [self._build_group_scope_message(event), *context]
-        reply = self._sanitize_reply(self.client.chat(messages))
+        messages = [self._build_group_scope_message(event, self.max_reply_chars), *context]
+        reply = self._sanitize_reply(
+            self.client.chat(messages),
+            group_nickname=event.group_nickname,
+            max_chars=self.max_reply_chars,
+        )
         if reply:
             context.append({"role": "assistant", "content": reply})
             del context[:-self.context_size]
@@ -406,7 +412,7 @@ class AIResponder:
         return f"{event.group}\n{event.group_nickname or ''}"
 
     @staticmethod
-    def _build_group_scope_message(event: MessageEvent) -> dict:
+    def _build_group_scope_message(event: MessageEvent, max_reply_chars: int = 180) -> dict:
         nickname = event.group_nickname or "当前登录账号"
         return {
             "role": "system",
@@ -414,13 +420,14 @@ class AIResponder:
                 f"当前只允许参考这个微信群的上下文。\n"
                 f"群聊名：{event.group}\n"
                 f"本账号在群里的昵称：{nickname}\n"
+                f"本次回复请控制在 {max_reply_chars} 个中文字符以内，优先自然收尾，不要靠突然截断变短。\n"
                 "如果用户问上一句、刚才、前面的人说了什么，只能回答本群上下文里的内容；"
                 "不要使用其他群聊或服务端记忆。"
             ),
         }
 
     @staticmethod
-    def _sanitize_reply(text: str) -> str:
+    def _sanitize_reply(text: str, group_nickname: Optional[str] = None, max_chars: int = 180) -> str:
         """清理模型偶发的 Markdown 痕迹，让回复更像微信文本。"""
         lines = []
         for raw_line in str(text or "").splitlines():
@@ -436,4 +443,32 @@ class AIResponder:
             lines.append(line)
         reply = " ".join(lines).strip()
         reply = reply.replace("**", "").replace("__", "").replace("`", "")
-        return reply[:500].strip()
+        if group_nickname:
+            reply = (
+                reply
+                .replace(f"@{group_nickname}\u2005", "")
+                .replace(f"@{group_nickname} ", "")
+                .replace(f"@{group_nickname}", "")
+            )
+        max_chars = max(20, int(max_chars or 180))
+        if len(reply) > max_chars:
+            reply = AIResponder._trim_at_sentence_boundary(reply, max_chars)
+        return reply.strip()
+
+    @staticmethod
+    def _trim_at_sentence_boundary(text: str, max_chars: int) -> str:
+        """兜底截断时尽量停在自然标点，减少突兀感。"""
+        if len(text) <= max_chars:
+            return text
+        clipped = text[:max_chars].rstrip()
+        boundary = max(
+            clipped.rfind("。"),
+            clipped.rfind("！"),
+            clipped.rfind("？"),
+            clipped.rfind("."),
+            clipped.rfind("!"),
+            clipped.rfind("?"),
+        )
+        if boundary >= max(20, int(max_chars * 0.55)):
+            return clipped[:boundary + 1].strip()
+        return clipped.rstrip("，、；;：:, ") + "..."

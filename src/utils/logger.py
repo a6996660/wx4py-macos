@@ -7,8 +7,16 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
+import traceback
 
-from ..config import LOG_LEVEL, LOG_FORMAT, LOG_FILE, SEND_AUDIT_LOG_FILE, GROUP_MENTION_LOG_ROOT
+from ..config import (
+    LOG_LEVEL,
+    LOG_FORMAT,
+    LOG_FILE,
+    SEND_AUDIT_LOG_FILE,
+    GROUP_MENTION_LOG_ROOT,
+    ERROR_LOG_ROOT,
+)
 
 
 def _ensure_parent_dir(file_path: str) -> None:
@@ -89,6 +97,33 @@ def log_group_mention_audit(group: str, payload: dict) -> Path:
         "group": group,
         **payload,
     }
+    with file_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+        handle.write("\n")
+    return file_path
+
+
+def log_error_audit(event: str, payload: dict, exc: Exception = None) -> Path:
+    """按日期写入错误审计日志。
+
+    路径形如：logs/errors/2026-05-02.log
+    用于集中记录 reply_failed、AI 调用异常、切群失败等关键错误。
+    """
+    now = datetime.now()
+    root = Path(os.environ.get("WECHAT_ERROR_LOG_ROOT", ERROR_LOG_ROOT))
+    file_path = root / f"{now.strftime('%Y-%m-%d')}.log"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    record = {
+        "time": now.isoformat(timespec="seconds"),
+        "event": event,
+        **payload,
+    }
+    if exc is not None:
+        record["error_type"] = type(exc).__name__
+        record["error"] = str(exc)
+        record["traceback"] = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
     with file_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
         handle.write("\n")

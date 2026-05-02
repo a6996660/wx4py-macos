@@ -36,3 +36,7 @@ GROUP_MENTION_LOG_ROOT = os.environ.get(
     "WECHAT_GROUP_MENTION_LOG_ROOT",
     str(Path.cwd() / "logs" / "group_mentions"),
 )
+ERROR_LOG_ROOT = os.environ.get(
+    "WECHAT_ERROR_LOG_ROOT",
+    str(Path.cwd() / "logs" / "errors"),
+)
