@@ -300,6 +300,114 @@ with WeChatClient() as wx:
 
 ---
 
+## macOS 适配与 AI 群聊机器人
+
+本仓库在原 Windows 自动化能力基础上，补充了 macOS 微信 4.x 的适配与一个可直接运行的群聊 @ 自动回复脚本。
+
+### macOS 已适配能力
+
+- 微信主窗口查找、激活与辅助功能树访问
+- 左侧会话列表识别，包括 `session_list`、`session_item_<群名>`
+- 基于左侧 `[有人@我]` 预览监听群聊 @ 消息
+- 启动时读取当前登录微信昵称，用于判断 `@我`
+- 多群消息进入同一个 AI 队列，逐条调用模型，避免并发抢占微信窗口
+- 发送队列串行切群、随机延迟发送，降低固定秒回特征
+- 按群隔离上下文，避免不同群同名成员导致上下文串用
+- 按日期/群名记录 @ 消息审计日志，按日期记录关键错误日志
+
+### macOS 设计约束
+
+macOS 微信主窗口通常只有一个聊天区，多群轮询聊天区容易读串。因此 macOS 端监听策略与 Windows 不同：
+
+- **监听消息**：只读取左侧会话列表的 `[有人@我]` 预览，不轮询当前聊天区。
+- **发送消息**：发送前再切换到目标群，找到输入框后粘贴并回车。
+- **已在目标群时**：不会重复点击左侧同一个会话项，避免弹出独立聊天窗口。
+
+建议运行时保持微信主窗口打开、不要最小化，尽量不要手动频繁切群或搜索。
+
+### 一键启动 AI 群聊机器人
+
+复制配置模板：
+
+```bash
+cp wx4py_ai_config.example.json wx4py_ai_config.json
+```
+
+编辑 `wx4py_ai_config.json`，填写监听群、模型服务和 API Key。示例：
+
+```json
+{
+  "groups": ["交个朋友", "大农村的打工人"],
+  "reply_delay_range": [5, 18],
+  "ai_queue_size": 0,
+  "ai_context_size": 8,
+  "ai_max_reply_chars": 180,
+  "group_log_root": "logs/group_mentions",
+  "error_log_root": "logs/errors",
+  "default": "ark",
+  "providers": {
+    "ark": {
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3/bots",
+      "api_format": "completions",
+      "model": "bot-xxxxxxxx",
+      "api_key": "replace-with-your-api-key",
+      "temperature": 0.7,
+      "max_tokens": 300,
+      "timeout": 60
+    }
+  }
+}
+```
+
+启动：
+
+```bash
+python3 run_ai_group_bot.py
+```
+
+脚本会使用单实例锁，避免多个机器人进程同时运行导致重复回复。
+
+### 日志与排错
+
+全局运行日志：
+
+```text
+wx4py.log
+```
+
+每个群每天的 @ 消息审计日志：
+
+```text
+logs/group_mentions/2026-05-02/群名.log
+```
+
+关键错误日志：
+
+```text
+logs/errors/2026-05-02.log
+```
+
+群聊审计日志会记录：
+
+- `received`：收到 @ 消息并进入 AI 队列
+- `reply_generated`：模型生成回复
+- `reply_sent`：回复发送成功
+- `reply_failed`：回复发送失败
+- `skipped`：跳过原因，例如未解析到发送人、重复消息、队列满
+
+关键错误日志会额外记录切群失败、AI 调用异常、找不到输入框、微信发送失败弹窗等问题，便于后续定位。
+
+### 使用注意
+
+- 仅建议监听少量明确配置的群聊。
+- 建议使用 `reply_on_at=True`，只在被 @ 时回复。
+- 不要高频群发或营销式发送；自动回复前应保留随机延迟。
+- `ai_max_reply_chars` 会写入模型提示词，让模型自然控制回复长度；程序端只做极端兜底。
+- 第三方模型是否能联网查询，取决于你配置的模型服务本身是否开启联网/检索能力。
+- `wx4py_ai_config.json` 已被 `.gitignore` 忽略，不要提交真实 API Key。
+
+---
+
 ## AI Skill 快速使用
 
 在 Claude Code 或 OpenClaw 中复制以下内容：
@@ -329,7 +437,7 @@ AI 会自动完成操作。
 <details>
 <summary><b>Q: 需要保持微信前台运行吗？</b></summary>
 
-是的，操作时微信窗口需要在前台。建议在专用机器或空闲时段运行自动化任务。
+建议微信主窗口保持打开且不要最小化。macOS 端不要求微信一直处于最前台，但发送时需要激活/聚焦微信窗口。为了稳定性，建议在专用机器或空闲时段运行自动化任务。
 
 </details>
 
@@ -402,6 +510,8 @@ wx4py 模拟真实用户操作，不修改微信客户端。但仍建议：
 ---
 
 ## 致谢
+
+本仓库基于原始项目 [claw-codes/wx4py](https://github.com/claw-codes/wx4py) 进行适配与扩展。原项目作者、贡献者及其知识产权声明应予以保留；本仓库新增的 macOS 适配、AI 群聊机器人启动脚本和相关配置说明，仍遵循原项目许可证与仓库中的授权条款。
 
 感谢 [linux.do 社区](https://linux.do/) 中相关讨论带来的启发，让这个项目的方向和落地方式逐步清晰起来。
 
