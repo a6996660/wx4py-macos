@@ -2,10 +2,13 @@
 """日志工具"""
 import json
 import logging
+import os
+import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
-from ..config import LOG_LEVEL, LOG_FORMAT, LOG_FILE, SEND_AUDIT_LOG_FILE
+from ..config import LOG_LEVEL, LOG_FORMAT, LOG_FILE, SEND_AUDIT_LOG_FILE, GROUP_MENTION_LOG_ROOT
 
 
 def _ensure_parent_dir(file_path: str) -> None:
@@ -60,3 +63,33 @@ def log_send_audit(payload: dict) -> None:
     get_send_audit_logger().info(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
+
+
+def _safe_log_filename(name: str) -> str:
+    """把群名转换为适合文件名的字符串。"""
+    safe = re.sub(r'[\\/:*?"<>|\n\r\t]+', "_", str(name or "").strip())
+    safe = safe.strip(" .")
+    return safe or "未命名群聊"
+
+
+def log_group_mention_audit(group: str, payload: dict) -> Path:
+    """按日期和群聊写入 @ 自动回复审计日志。
+
+    路径形如：logs/group_mentions/2026-05-02/群名.log
+    每行是一条 JSON，便于后续检索、统计或导入分析。
+    """
+    now = datetime.now()
+    date_dir = now.strftime("%Y-%m-%d")
+    root = Path(os.environ.get("WECHAT_GROUP_MENTION_LOG_ROOT", GROUP_MENTION_LOG_ROOT))
+    file_path = root / date_dir / f"{_safe_log_filename(group)}.log"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    record = {
+        "time": now.isoformat(timespec="seconds"),
+        "group": group,
+        **payload,
+    }
+    with file_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+        handle.write("\n")
+    return file_path

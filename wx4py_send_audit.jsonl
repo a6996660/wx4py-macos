@@ -1,3 +1,6 @@
 {"run_id":"cfa8cab0-9519-49f4-b4f8-2ef57c166a03","target":"丁某某","attempt":1,"phase":"open","success":false,"exception_type":"TargetNotFoundError","exception_msg":"'丁某某' not found in '联系人' group","elapsed_ms":13088}
 {"run_id":"a5b3b427-e40d-4fbc-98f6-826b55ac0e42","target":"丁某某","attempt":1,"phase":"open","success":false,"exception_type":"TargetNotFoundError","exception_msg":"'丁某某' not found in '联系人' group","elapsed_ms":12967}
 {"run_id":"5004d7bd-d0c4-4044-b8fa-e24053ccbd99","target":"丁某某","attempt":1,"phase":"open","success":false,"exception_type":"TargetNotFoundError","exception_msg":"'丁某某' not found in '联系人' group","elapsed_ms":1878}
+{"run_id":"7e4c68cd-eb9b-4fec-b297-ef125be86ed6","target":"丁某某","attempt":1,"phase":"open","success":false,"exception_type":"TargetNotFoundError","exception_msg":"'丁某某' not found in '联系人' group","elapsed_ms":54012}
+{"run_id":"b7944c0a-a2ee-42f6-ba49-31fde2e2d93d","target":"丁某某","attempt":1,"phase":"open","success":true,"exception_type":"","exception_msg":"","elapsed_ms":195558}
+{"run_id":"b7944c0a-a2ee-42f6-ba49-31fde2e2d93d","target":"丁某某","attempt":1,"phase":"send","success":true,"exception_type":"","exception_msg":"","elapsed_ms":1988}

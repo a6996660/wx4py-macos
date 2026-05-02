@@ -1,0 +1,32 @@
+{
+  "_说明": "复制本文件为 wx4py_ai_config.json 后填写真实配置。wx4py_ai_config.json 已在 .gitignore 中，不会提交 API Key。",
+  "groups": [
+    "交个朋友"
+  ],
+  "_groups_说明": "只监听这里列出的群聊。macOS 下会从左侧会话列表精确点击群名，不会搜索群名。",
+  "reply_delay_range": [
+    5,
+    18
+  ],
+  "_reply_delay_range_说明": "自动回复前的随机等待秒数范围，降低固定秒回的机械特征。",
+  "ai_queue_size": 0,
+  "_ai_queue_size_说明": "大模型消息队列长度。0 表示不限制；建议多群监听时保持 0 或设置为较大值，例如 100。队列会逐条调用大模型、逐条发送回复，不并发。",
+  "ai_context_size": 8,
+  "_ai_context_size_说明": "同一个群传给大模型的最近上下文消息数。上下文会带发送人，例如：张三说: 你好。",
+  "group_log_root": "logs/group_mentions",
+  "_group_log_root_说明": "群聊 @ 自动回复审计日志目录。程序会按日期建子目录，并按群名单独写 log 文件。",
+  "default": "ark",
+  "_default_说明": "默认使用 providers 中的哪个模型服务配置。",
+  "providers": {
+    "ark": {
+      "_说明": "火山引擎 Ark Bots/OpenAI-compatible 配置。",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3/bots",
+      "api_format": "completions",
+      "model": "bot-20241125225426-wzcrl",
+      "api_key": "replace-with-your-ark-api-key",
+      "temperature": 0.7,
+      "max_tokens": 300,
+      "timeout": 60
+    }
+  }
+}

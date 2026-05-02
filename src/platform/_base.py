@@ -41,6 +41,22 @@ class _LazyControl:
         self._resolved = None       # None=未解析, PlatformControl=已找到, _NOT_FOUND=已查找未找到
         self._resolving = False     # 防递归标志
 
+    @staticmethod
+    def _normalize_search_kwargs(search_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """兼容 Windows UIAutomation 的 PascalCase 查找参数。"""
+        key_map = {
+            "Name": "name",
+            "ClassName": "class_name",
+            "AutomationId": "automation_id",
+            "searchDepth": "search_depth",
+            "SearchDepth": "search_depth",
+            "maxSearchSeconds": "timeout",
+        }
+        normalized: Dict[str, Any] = {}
+        for key, value in search_kwargs.items():
+            normalized[key_map.get(key, key)] = value
+        return normalized
+
     # —— 延迟解析 ——
 
     def _resolve(self):
@@ -71,7 +87,7 @@ class _LazyControl:
             result = self._backend.find_control(
                 parent,
                 control_type=self._control_type,
-                **self._search_kwargs,
+                **self._normalize_search_kwargs(self._search_kwargs),
             )
             if result is not None:
                 self._resolved = result

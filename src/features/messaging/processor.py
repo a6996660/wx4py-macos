@@ -19,10 +19,11 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from collections import OrderedDict
 from typing import Callable, Iterable, List, Optional, Sequence, Union
 
 from .listener import MessageEvent, WeChatGroupListener
-from ...utils.logger import get_logger
+from ...utils.logger import get_logger, log_group_mention_audit
 
 logger = get_logger(__name__)
 
@@ -38,6 +39,8 @@ class ReplyAction(MessageAction):
 
     group: str
     content: str
+    sender_nickname: str = ""
+    original_content: str = ""
 
 
 @dataclass(frozen=True)
@@ -101,7 +104,47 @@ class CallbackHandler(MessageHandler):
             return None
         if self.reply_on_at and not event.is_at_me:
             return None
-        return ReplyAction(group=event.group, content=text)
+        if self.reply_on_at and not (event.sender_nickname or "").strip():
+            logger.warning("跳过自动回复：未解析到 @ 发送人，group=%s", event.group)
+            self._audit_event(event, "skipped", reason="missing_sender_before_reply")
+            return None
+        if self.reply_on_at:
+            text = self._prefix_sender_mention(event, text)
+        self._audit_event(event, "reply_generated", reply=text)
+        return ReplyAction(
+            group=event.group,
+            content=text,
+            sender_nickname=event.sender_nickname or "",
+            original_content=event.content or "",
+        )
+
+    @staticmethod
+    def _audit_event(event: MessageEvent, event_type: str, **extra) -> None:
+        try:
+            log_group_mention_audit(
+                event.group,
+                {
+                    "event": event_type,
+                    "sender": event.sender_nickname or "",
+                    "message": event.content or "",
+                    "is_at_me": event.is_at_me,
+                    "context_key": f"{event.group}|{event.group_nickname or ''}",
+                    **extra,
+                },
+            )
+        except Exception as exc:
+            logger.debug("写入群聊 @ 审计日志失败: %s", exc)
+
+    @staticmethod
+    def _prefix_sender_mention(event: MessageEvent, text: str) -> str:
+        sender = (event.sender_nickname or "").strip()
+        if not sender or sender in {"我", "你"}:
+            return text
+
+        mention = f"@{sender}"
+        if text == mention or text.startswith(f"{mention} ") or text.startswith(f"{mention}\u2005"):
+            return text
+        return f"{mention} {text}"
 
 
 class AsyncCallbackHandler(CallbackHandler):
@@ -124,6 +167,8 @@ class AsyncCallbackHandler(CallbackHandler):
         self._emit_action = None
         self._worker: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._recent_events: "OrderedDict[tuple, float]" = OrderedDict()
+        self._dedupe_ttl = 120.0
 
     def set_action_emitter(self, emit_action) -> None:
         self._emit_action = emit_action
@@ -134,11 +179,79 @@ class AsyncCallbackHandler(CallbackHandler):
         self._worker.start()
 
     def handle(self, event: MessageEvent):
+        if self.reply_on_at and not event.is_at_me:
+            return None
+        if self.reply_on_at and not (event.sender_nickname or "").strip():
+            logger.warning("跳过大模型队列：未解析到 @ 发送人，group=%s", event.group)
+            self._audit_event(event, "skipped", reason="missing_sender_before_ai_queue")
+            return None
+        event = self._snapshot_event(event)
+        if self._is_duplicate_event(event):
+            logger.info(
+                "跳过重复 @ 消息: group=%s, sender=%s, content=%s",
+                event.group,
+                event.sender_nickname or "",
+                (event.content or "")[:80],
+            )
+            self._audit_event(event, "skipped", reason="duplicate_event")
+            return None
         try:
             self._jobs.put_nowait(event)
+            self._audit_event(
+                event,
+                "received",
+                queue_pending=self._jobs.qsize(),
+            )
+            logger.info(
+                "消息已进入大模型队列: group=%s, sender=%s, at=%s, pending=%s, content=%s",
+                event.group,
+                event.sender_nickname or "",
+                event.is_at_me,
+                self._jobs.qsize(),
+                (event.content or "")[:80],
+            )
         except queue.Full:
             logger.warning("异步回调队列已满，丢弃消息: %s", event.group)
+            self._audit_event(event, "skipped", reason="ai_queue_full")
         return None
+
+    def _is_duplicate_event(self, event: MessageEvent) -> bool:
+        now = time.time()
+        while self._recent_events:
+            _key, created_at = next(iter(self._recent_events.items()))
+            if now - created_at <= self._dedupe_ttl:
+                break
+            self._recent_events.popitem(last=False)
+
+        key = (
+            event.group,
+            self._dedupe_content(event.content),
+        )
+        if key in self._recent_events:
+            self._recent_events.move_to_end(key)
+            self._recent_events[key] = now
+            return True
+        self._recent_events[key] = now
+        return False
+
+    @staticmethod
+    def _dedupe_content(content: str) -> str:
+        text = " ".join(str(content or "").split())
+        text = text.replace("\u2005", " ").replace("\u00a0", " ")
+        return " ".join(text.split())
+
+    @staticmethod
+    def _snapshot_event(event: MessageEvent) -> MessageEvent:
+        """复制为纯数据事件，避免后台线程持有 UIAutomation/AX 控件对象。"""
+        return MessageEvent(
+            group=event.group,
+            content=event.content,
+            timestamp=event.timestamp,
+            group_nickname=event.group_nickname,
+            sender_nickname=event.sender_nickname,
+            is_at_me=event.is_at_me,
+            raw=None,
+        )
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -161,6 +274,13 @@ class AsyncCallbackHandler(CallbackHandler):
                 continue
 
             try:
+                logger.info(
+                    "开始处理大模型队列消息: group=%s, sender=%s, pending=%s, content=%s",
+                    event.group,
+                    event.sender_nickname or "",
+                    self._jobs.qsize(),
+                    (event.content or "")[:80],
+                )
                 result = self.callback(event)
                 for action in WeChatGroupProcessor._normalize_actions(self._build_actions(event, result)):
                     if self._emit_action:
@@ -185,6 +305,7 @@ class WeChatGroupProcessor:
         tick: float = 0.1,
         batch_size: int = 8,
         tail_size: int = 8,
+        reply_delay_range=(3.0, 9.0),
     ):
         self.client = client
         self.groups = list(dict.fromkeys(groups))
@@ -199,6 +320,7 @@ class WeChatGroupProcessor:
         self.tick = tick
         self.batch_size = batch_size
         self.tail_size = tail_size
+        self.reply_delay_range = reply_delay_range
 
         self._listener: Optional[WeChatGroupListener] = None
         self._action_queue: "queue.Queue[MessageAction]" = queue.Queue()
@@ -225,6 +347,7 @@ class WeChatGroupProcessor:
             tick=self.tick,
             batch_size=self.batch_size,
             tail_size=self.tail_size,
+            reply_delay_range=self.reply_delay_range,
         )
         self._listener.start(block=False)
 
@@ -309,8 +432,19 @@ class WeChatGroupProcessor:
         if not text:
             return
         sent = self._listener.reply(action.group, text)
-        if sent:
-            return
+        try:
+            log_group_mention_audit(
+                action.group,
+                {
+                    "event": "reply_sent" if sent else "reply_failed",
+                    "sender": action.sender_nickname,
+                    "message": action.original_content,
+                    "context_key": f"{action.group}|",
+                    "reply": text,
+                },
+            )
+        except Exception as exc:
+            logger.debug("写入群聊回复审计日志失败: %s", exc)
 
     def _execute_forward(self, action: ForwardAction) -> None:
         text = (action.content or "").strip()

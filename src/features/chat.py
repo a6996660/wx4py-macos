@@ -198,6 +198,10 @@ class ChatWindow(BasePage):
         try:
             try:
                 edit.Click(simulateMove=False)
+                try:
+                    edit.SetFocus()
+                except Exception:
+                    pass
             except Exception:
                 try:
                     edit.SetFocus()
@@ -306,6 +310,12 @@ class ChatWindow(BasePage):
         # 优先级3：功能
         if target_type == 'contact':
             for item in results.get(GROUP_FUNCTIONS, []):
+                if target in item.name:
+                    return item
+
+        # macOS 搜索结果可能没有稳定分组，兜底在所有分组中找名称匹配项。
+        for items in results.values():
+            for item in items:
                 if target in item.name:
                     return item
 
@@ -483,7 +493,7 @@ class ChatWindow(BasePage):
                     root_rect = self.root.BoundingRectangle
                     if edit_rect and root_rect:
                         # 搜索框通常在窗口顶部区域
-                        if edit_rect.top < root_rect.top + root_rect.height() * 0.3:
+                        if edit_rect.top < root_rect.top + root_rect.height * 0.3:
                             # 并且宽度合理
                             if edit_rect.right - edit_rect.left > 100:
                                 return True
@@ -530,7 +540,7 @@ class ChatWindow(BasePage):
 
                         if rect and root_rect:
                             # 优先选择靠近顶部的编辑框
-                            relative_top = (rect.top - root_rect.top) / root_rect.height()
+                            relative_top = (rect.top - root_rect.top) / root_rect.height
                             if relative_top < 0.2:  # 窗口顶部 20%
                                 score += 100
                             elif relative_top < 0.4:  # 窗口顶部 40%
@@ -602,7 +612,7 @@ class ChatWindow(BasePage):
                     rect = edit.BoundingRectangle
                     root_rect = self.root.BoundingRectangle
                     # 聊天输入框通常在窗口下半部
-                    if rect and root_rect and rect.top > (root_rect.top + root_rect.height() * 0.5):
+                    if rect and root_rect and rect.top > (root_rect.top + root_rect.height * 0.5):
                         return edit
             except Exception:
                 continue
@@ -673,6 +683,22 @@ class ChatWindow(BasePage):
             class_name = item.ClassName or ""
             name = item.Name or ""
             auto_id = item.AutomationId or ""
+
+            # macOS Accessibility often exposes search/session rows as generic
+            # AXStaticText with an AXIdentifier such as session_item_<name>,
+            # not as Windows Qt SearchContentCellView controls.
+            if auto_id.startswith(('session_item_', 'search_item_')) and name:
+                group = current_group or GROUP_CONTACTS
+                result = SearchResult(
+                    name=name,
+                    ctrl=item,
+                    item_type='contact',
+                    auto_id=auto_id,
+                    group=group,
+                )
+                groups.setdefault(group, []).append(result)
+                logger.debug(f"找到 macOS 搜索/会话项: {name} 在 {group}")
+                continue
 
             # 分组标题：没有 AutoId 的 XTableCell
             if class_name == 'mmui::XTableCell' and not auto_id:
@@ -824,7 +850,21 @@ class ChatWindow(BasePage):
 
         popup = self._get_search_popup()
         if not popup:
-            logger.warning("未找到搜索弹出面板")
+            logger.warning("未找到搜索弹出面板，尝试从 macOS 可见控件树解析搜索结果")
+            macos_items = []
+            try:
+                for control, _depth in platform.automation.walk_control(
+                    self.root, include_top=True, max_depth=8
+                ):
+                    auto_id = control.AutomationId or ""
+                    if auto_id.startswith(('session_item_', 'search_item_')):
+                        macos_items.append(control)
+            except Exception as exc:
+                logger.debug(f"macOS 搜索结果兜底遍历失败: {exc}")
+            if macos_items:
+                results = self._parse_search_results(macos_items)
+                self._last_search_results = results
+                return results
             return {}
 
         # 尝试多个可能的 AutomationId 查找搜索列表
@@ -1213,11 +1253,14 @@ class ChatWindow(BasePage):
             for child in msg_list.GetChildren():
                 cls = child.ClassName or ""
                 name = child.Name or ""
-                if cls == time_cls:
+                auto_id = child.AutomationId or ""
+                if cls == time_cls or (auto_id == "" and time_re.match(name)):
                     kind = 'time' if time_re.match(name) else 'system'
                     items.append((kind, name))
-                elif cls in msg_types:
+                elif cls in msg_types or auto_id == 'chat_bubble_item_view':
                     kind = 'text' if 'Text' in cls else 'link'
+                    if auto_id == 'chat_bubble_item_view':
+                        kind = 'text'
                     items.append((kind, name))
         except Exception:
             return []

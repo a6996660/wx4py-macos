@@ -13,24 +13,64 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
 from .features.messaging.listener import MessageEvent
 
 ApiFormat = Literal["completions", "responses", "anthropic"]
+_MISSING = object()
 
 
-DEFAULT_SYSTEM_PROMPT = """你正在微信群聊里回复消息。
+DEFAULT_SYSTEM_PROMPT = """你正在微信群聊里聊天，请像微信里的真人朋友一样回复。
 要求：
-1. 回复自然、简短，像真人聊天。
-2. 不要说自己是 AI。
-3. 不要每次都解释太多。
-4. 如果消息不需要回复，可以只返回空字符串。
+1. 回复要短、自然、口语化，优先 1 到 2 句话，不要长篇解释。
+2. 不要使用 Markdown，不要标题、列表、加粗、引用块、代码块或表格。
+3. 不要说自己是 AI、机器人或模型；被问到身份、模型、开发公司时，不要编造具体公司或模型名，不清楚就说不太清楚。
+4. 不确定时就简短说明不知道或不太确定，绝对不要编造具体数据、来源、时间、公司、人名、政策或价格。
+5. 如果消息不需要回复，可以只返回空字符串。
+6. 用户消息里的“张三说:”表示发言人是张三，不是你的身份；不要冒充发言人。
+7. 不要主动在回复开头 @ 对方，发送程序会自动添加 @。
+8. 语气可以轻松一点，但不要油腻，不要每句都带感叹号。
+9. 如果用户问“上一句/刚才说了什么”，只根据当前上下文回答；上下文没有就说没看到。
+10. 不同微信群聊的上下文必须完全隔离，不要引用其他群聊里的任何消息。
+11. 遇到天气、新闻、股价、价格、政策、赛事、日程等实时问题，如果你具备联网或检索能力，可以先查询再回答；如果查不到可靠信息，就直接说“我这边查不到准确信息”。
+12. 联网查询后的回答也要适合微信聊天，简短说明结果即可，不要堆链接和大段资料。
 """
+
+
+def _config_value(data: dict, key: str, env_prefix: str, default=_MISSING):
+    env_key = f"{env_prefix}_{key}".upper()
+    generic_env_key = f"AI_{key}".upper()
+    if os.environ.get(env_key) not in (None, ""):
+        return os.environ[env_key]
+    if os.environ.get(generic_env_key) not in (None, ""):
+        return os.environ[generic_env_key]
+    value = data.get(key, default)
+    if value in (None, "", _MISSING) and default is _MISSING:
+        raise ValueError(f"AI 配置缺少必填项: {key}")
+    if value is _MISSING:
+        return None
+    return value
+
+
+def _optional_bool(value) -> Optional[bool]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
 
 
 @dataclass(frozen=True)
@@ -45,7 +85,65 @@ class AIConfig:
     temperature: float = 0.7
     max_tokens: int = 300
     timeout: float = 60.0
-    enable_thinking: Optional[bool] = False
+    enable_thinking: Optional[bool] = None
+
+    @classmethod
+    def from_file(
+        cls,
+        path: Optional[str] = None,
+        *,
+        provider: Optional[str] = None,
+        env_prefix: Optional[str] = None,
+    ) -> "AIConfig":
+        """从本地 JSON 配置文件创建 AIConfig。
+
+        默认读取当前工作目录的 ``wx4py_ai_config.json``，也可通过
+        ``WX4PY_AI_CONFIG`` 指定路径。支持两种格式：
+
+        1. 扁平格式：直接包含 base_url/api_key/model 等字段。
+        2. providers 格式：{"default": "ark", "providers": {"ark": {...}}}
+
+        环境变量可覆盖配置文件，前缀由 ``env_prefix`` 或 provider 推断。
+        例如 provider="ark" 时会读取 ARK_API_KEY/ARK_BASE_URL/ARK_MODEL。
+        """
+        config_path = Path(
+            path
+            or os.environ.get("WX4PY_AI_CONFIG", "")
+            or (Path.cwd() / "wx4py_ai_config.json")
+        )
+        if not config_path.exists():
+            raise FileNotFoundError(f"AI 配置文件不存在: {config_path}")
+
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"AI 配置文件 JSON 格式错误: {config_path}: {exc}") from exc
+
+        selected_provider = provider or data.get("default")
+        if "providers" in data:
+            providers = data.get("providers") or {}
+            if not selected_provider:
+                if len(providers) == 1:
+                    selected_provider = next(iter(providers))
+                else:
+                    raise ValueError("AI 配置包含多个 providers，请设置 default 或传入 provider")
+            try:
+                data = providers[selected_provider]
+            except KeyError as exc:
+                raise ValueError(f"AI provider 不存在: {selected_provider}") from exc
+
+        prefix = env_prefix or (str(selected_provider).upper() if selected_provider else "AI")
+        return cls(
+            base_url=_config_value(data, "base_url", prefix),
+            model=_config_value(data, "model", prefix),
+            api_key=_config_value(data, "api_key", prefix),
+            api_format=_config_value(data, "api_format", prefix, default="completions"),
+            system_prompt=_config_value(data, "system_prompt", prefix, default=DEFAULT_SYSTEM_PROMPT),
+            temperature=float(_config_value(data, "temperature", prefix, default=0.7)),
+            max_tokens=int(_config_value(data, "max_tokens", prefix, default=300)),
+            timeout=float(_config_value(data, "timeout", prefix, default=60.0)),
+            enable_thinking=_optional_bool(_config_value(data, "enable_thinking", prefix, default=None)),
+        )
 
 
 class AIClient:
@@ -212,6 +310,8 @@ class AIClient:
                 return normalized
             if AIClient._has_path_suffix(path, ["/v1"]):
                 return f"{normalized}/chat/completions"
+            if path:
+                return f"{normalized}/chat/completions"
             return f"{normalized}/v1/chat/completions"
 
         if api_format == "responses":
@@ -266,15 +366,18 @@ class AIResponder:
         if self.reply_on_at and not event.is_at_me:
             return ""
 
-        content = self._strip_at(event.content, event.group_nickname)
+        raw_content = str(event.content or "").strip()
+        content = self._strip_at(raw_content, event.group_nickname)
         if not content:
             return ""
 
-        context = self.contexts.setdefault(event.group, [])
-        context.append({"role": "user", "content": content})
+        context_key = self._context_key(event)
+        context = self.contexts.setdefault(context_key, [])
+        context.append({"role": "user", "content": self._format_user_content(event, raw_content)})
         del context[:-self.context_size]
 
-        reply = self.client.chat(context)
+        messages = [self._build_group_scope_message(event), *context]
+        reply = self._sanitize_reply(self.client.chat(messages))
         if reply:
             context.append({"role": "assistant", "content": reply})
             del context[:-self.context_size]
@@ -290,3 +393,47 @@ class AIResponder:
             .replace(f"@{nickname}", "")
             .strip()
         )
+
+    @staticmethod
+    def _format_user_content(event: MessageEvent, content: str) -> str:
+        sender = (event.sender_nickname or "").strip()
+        if sender and sender not in {"我", "你"}:
+            return f"{sender}说: {content}"
+        return f"群成员说: {content}"
+
+    @staticmethod
+    def _context_key(event: MessageEvent) -> str:
+        return f"{event.group}\n{event.group_nickname or ''}"
+
+    @staticmethod
+    def _build_group_scope_message(event: MessageEvent) -> dict:
+        nickname = event.group_nickname or "当前登录账号"
+        return {
+            "role": "system",
+            "content": (
+                f"当前只允许参考这个微信群的上下文。\n"
+                f"群聊名：{event.group}\n"
+                f"本账号在群里的昵称：{nickname}\n"
+                "如果用户问上一句、刚才、前面的人说了什么，只能回答本群上下文里的内容；"
+                "不要使用其他群聊或服务端记忆。"
+            ),
+        }
+
+    @staticmethod
+    def _sanitize_reply(text: str) -> str:
+        """清理模型偶发的 Markdown 痕迹，让回复更像微信文本。"""
+        lines = []
+        for raw_line in str(text or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            line = line.strip("*_`#> ")
+            for prefix in ("- ", "* ", "• "):
+                if line.startswith(prefix):
+                    line = line[len(prefix):].strip()
+            if len(line) > 2 and line[0].isdigit() and line[1] in {".", "、"}:
+                line = line[2:].strip()
+            lines.append(line)
+        reply = " ".join(lines).strip()
+        reply = reply.replace("**", "").replace("__", "").replace("`", "")
+        return reply[:500].strip()

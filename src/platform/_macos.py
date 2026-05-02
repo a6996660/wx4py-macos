@@ -91,6 +91,14 @@ if _PYOBJC_AVAILABLE:
         _ax_c.AXMakeProcessTrusted.restype = ctypes.c_int32
         _ax_c.AXMakeProcessTrusted.argtypes = [ctypes.c_void_p]
 
+        _ax_c.AXValueGetType.restype = ctypes.c_int32
+        _ax_c.AXValueGetType.argtypes = [ctypes.c_void_p]
+
+        _ax_c.AXValueGetValue.restype = ctypes.c_bool
+        _ax_c.AXValueGetValue.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p,
+        ]
+
         # CFString helpers
         _cf.CFStringCreateWithCString.restype = ctypes.c_void_p
         _cf.CFStringCreateWithCString.argtypes = [
@@ -210,6 +218,14 @@ def _ax_is_trusted() -> bool:
     return bool(_ax_c.AXIsProcessTrusted())
 
 
+class _CGPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+class _CGSize(ctypes.Structure):
+    _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+
 # ============================================================================
 # macOS 微信控件映射常量 (Task 13)
 # ============================================================================
@@ -248,6 +264,22 @@ WECHAT_AX_DESCRIPTIONS = {
 
 # 微信窗口标题关键词
 WECHAT_WINDOW_TITLES = ("微信", "WeChat")
+
+_UIA_TO_AX_ROLES = {
+    "Button": ("AXButton",),
+    "CheckBox": ("AXCheckBox",),
+    "Custom": ("AXGroup", "AXUnknown"),
+    "DataGrid": ("AXTable", "AXGrid"),
+    "Edit": ("AXTextField", "AXTextArea", "AXComboBox"),
+    "Group": ("AXGroup", "AXSplitGroup"),
+    "List": ("AXList", "AXOutline", "AXTable"),
+    "ListItem": ("AXRow", "AXCell", "AXStaticText"),
+    "Pane": ("AXScrollArea", "AXPopover", "AXSplitGroup", "AXGroup"),
+    "Tab": ("AXTabGroup", "AXRadioGroup"),
+    "Text": ("AXStaticText",),
+    "Tree": ("AXOutline",),
+    "Window": ("AXWindow",),
+}
 
 
 # ============================================================================
@@ -329,13 +361,40 @@ def _find_wechat_window_element() -> Any:
     try:
         windows, _ = _ax_copy_attr(app_ref, "AXWindows")
         if windows:
+            candidates = []
             for window in windows:
                 try:
                     title, _ = _ax_copy_attr(window, "AXTitle")
-                    if title and any(kw in str(title) for kw in WECHAT_WINDOW_TITLES):
-                        return window
+                    title = str(title or "")
+                    pos = _ax_get_position(window)
+                    size = _ax_get_size(window)
+                    children_count = len(_ax_get_children(window))
+                    area = (size[0] * size[1]) if size else 0
+                    has_session_list = _ax_tree_has_session_list(window)
+                    score = 0
+                    if title == "微信":
+                        score += 500
+                    elif any(kw in title for kw in WECHAT_WINDOW_TITLES):
+                        score += 100
+                    if has_session_list:
+                        score += 1000
+                    else:
+                        score -= 300
+                    if children_count:
+                        score += min(children_count, 20) * 10
+                    if area >= 300000:
+                        score += 80
+                    if "窗口" in title:
+                        score -= 200
+                    if pos and (pos[0] < 0 or pos[1] < 0):
+                        score -= 50
+                    if score > 0:
+                        candidates.append((score, area, children_count, window))
                 except Exception:
                     continue
+            if candidates:
+                candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+                return candidates[0][3]
     except Exception:
         pass
 
@@ -343,10 +402,31 @@ def _find_wechat_window_element() -> Any:
     try:
         windows, _ = _ax_copy_attr(app_ref, "AXWindows")
         if windows and len(windows) > 0:
+            for window in windows:
+                if _ax_tree_has_session_list(window):
+                    return window
             return windows[0]
     except Exception:
         pass
     return None
+
+
+def _ax_tree_has_session_list(element: Any, max_depth: int = 6) -> bool:
+    """判断窗口是否是带左侧会话列表的微信主窗口。"""
+    stack = [(element, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > max_depth:
+            continue
+        try:
+            identifier = str(_ax_get_attr(node, "AXIdentifier") or "")
+            if identifier == "session_list" or identifier.startswith("session_item_"):
+                return True
+            for child in reversed(_ax_get_children(node)):
+                stack.append((child, depth + 1))
+        except Exception:
+            continue
+    return False
 
 
 def _ax_get_attr(element: Any, attr: str) -> Optional[Any]:
@@ -399,8 +479,9 @@ def _ax_get_position(element: Any) -> Optional[Tuple[float, float]]:
     try:
         pos, _ = _ax_copy_attr(element, "AXPosition")
         if pos:
-            pt = Quartz.CGPointFromString(str(pos))
-            return (pt.x, pt.y)
+            pt = _CGPoint()
+            if _ax_c.AXValueGetValue(_ax_objc_to_ptr(pos), 1, ctypes.byref(pt)):
+                return (pt.x, pt.y)
     except Exception:
         pass
     return None
@@ -410,8 +491,9 @@ def _ax_get_size(element: Any) -> Optional[Tuple[float, float]]:
     try:
         size, _ = _ax_copy_attr(element, "AXSize")
         if size:
-            sz = Quartz.CGSizeFromString(str(size))
-            return (sz.width, sz.height)
+            sz = _CGSize()
+            if _ax_c.AXValueGetValue(_ax_objc_to_ptr(size), 2, ctypes.byref(sz)):
+                return (sz.width, sz.height)
     except Exception:
         pass
     return None
@@ -458,9 +540,10 @@ def _ax_walk_tree(element: Any, max_depth: int = 6) -> List[Tuple[Any, int]]:
 
 def _ax_find_descendants(
     element: Any,
-    role: str = None,
+    role: Any = None,
     title: str = None,
     description_contains: str = None,
+    automation_id: str = None,
     max_depth: int = 10,
     max_results: int = None,
 ) -> List[Any]:
@@ -476,11 +559,19 @@ def _ax_find_descendants(
         match = True
         if role:
             node_role = _ax_get_role(node)
-            if node_role != role:
+            roles = role if isinstance(role, (list, tuple, set)) else (role,)
+            if node_role not in roles:
                 match = False
         if match and title:
             node_title = _ax_get_title(node)
-            if title not in node_title:
+            node_desc = _ax_get_description(node)
+            node_value = _ax_get_value(node)
+            searchable_name = " ".join((node_title, node_desc, node_value))
+            if title not in searchable_name:
+                match = False
+        if match and automation_id:
+            node_id = _ax_get_attr(node, "AXIdentifier")
+            if str(node_id or "") != automation_id:
                 match = False
         if match and description_contains:
             node_desc = _ax_get_description(node) + " " + _ax_get_title(node) + " " + _ax_get_role(node)
@@ -529,15 +620,38 @@ def _register_window(element: Any) -> int:
     return wid
 
 
+def _can_use_ax() -> bool:
+    return _AX_AVAILABLE and check_accessibility_permission()
+
+
 def _get_window_element(wid: int) -> Optional[Any]:
     """获取窗口 AX 元素，每次都实时查询以避免缓存元素失效。"""
     # 优先实时查询
-    if _AX_AVAILABLE:
+    if _can_use_ax():
         window = _find_wechat_window_element()
         if window:
             return window
     # 回退使用缓存
-    return _window_id_map.get(wid)
+    cached = _window_id_map.get(wid)
+    return None if isinstance(cached, int) else cached
+
+
+def _get_window_cgid(wid: int) -> Optional[int]:
+    cached = _window_id_map.get(wid)
+    return cached if isinstance(cached, int) else None
+
+
+def _get_cg_window_info(cgid: int) -> Optional[dict]:
+    if not _PYOBJC_AVAILABLE or not cgid:
+        return None
+    try:
+        window_list = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionIncludingWindow,
+            cgid,
+        )
+        return dict(window_list[0]) if window_list else None
+    except Exception:
+        return None
 
 
 # ============================================================================
@@ -561,7 +675,6 @@ class _MacOSControlAdapter:
         val = _ax_get_attr(ctrl._native, "AXIdentifier")
         return str(val) if val else ""
 
-    @staticmethod
     @staticmethod
     def get_control_type_name(ctrl: PlatformControl) -> str:
         role = _ax_get_role(ctrl._native)
@@ -617,7 +730,13 @@ class _MacOSControlAdapter:
             if rect:
                 _simulate_mouse_click(rect.center_x, rect.center_y)
                 return True
-        return _ax_perform_action(ctrl._native, "AXPress")
+        if _ax_perform_action(ctrl._native, "AXPress"):
+            return True
+        rect = _MacOSControlAdapter.get_bounding_rectangle(ctrl)
+        if rect:
+            _simulate_mouse_click(rect.center_x, rect.center_y)
+            return True
+        return False
 
     @staticmethod
     def double_click(ctrl: PlatformControl, simulateMove: bool = True) -> bool:
@@ -633,12 +752,17 @@ class _MacOSControlAdapter:
 
     @staticmethod
     def send_keys(ctrl: PlatformControl, text: str) -> bool:
-        # macOS AX 中设置文本通常需要 AXValue 可写
-        try:
-            _ax_set_attr(ctrl._native, "AXValue", text)
+        if _send_uia_keys(text):
             return True
-        except Exception:
-            pass
+
+        role = _ax_get_role(ctrl._native)
+        if role in {"AXTextField", "AXTextArea", "AXComboBox"}:
+            try:
+                if _ax_set_attr(ctrl._native, "AXValue", text) == 0:
+                    return True
+            except Exception:
+                pass
+
         # Fallback: 聚焦后模拟键盘输入
         _ax_perform_action(ctrl._native, "AXRaise")
         try:
@@ -778,6 +902,83 @@ def _simulate_set_cursor(x: int, y: int) -> None:
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, point, 0))
 
 
+_SENDKEY_ALIASES = {
+    "CTRL": InputSimulator.VK_CONTROL,
+    "CONTROL": InputSimulator.VK_CONTROL,
+    "ENTER": InputSimulator.VK_RETURN,
+    "RETURN": InputSimulator.VK_RETURN,
+    "ESC": InputSimulator.VK_ESCAPE,
+    "ESCAPE": InputSimulator.VK_ESCAPE,
+    "DELETE": InputSimulator.VK_DELETE,
+    "DEL": InputSimulator.VK_DELETE,
+    "TAB": InputSimulator.VK_TAB,
+    "SPACE": InputSimulator.VK_SPACE,
+    "SHIFT": InputSimulator.VK_SHIFT,
+}
+
+_SENDKEY_CHAR_MAP = {
+    "a": InputSimulator.VK_A,
+    "c": InputSimulator.VK_C,
+    "f": InputSimulator.VK_F,
+    "v": InputSimulator.VK_V,
+}
+
+
+def _parse_uia_send_keys(text: str) -> Optional[Tuple[List[int], Optional[int]]]:
+    """解析 uiautomation 风格的短按键表达式，如 {Ctrl}a、{Enter}。"""
+    if not text or "{" not in text or "}" not in text:
+        return None
+
+    modifiers: List[int] = []
+    key: Optional[int] = None
+    pos = 0
+    while pos < len(text):
+        if text[pos] == "{":
+            end = text.find("}", pos + 1)
+            if end == -1:
+                return None
+            token = text[pos + 1:end].strip().upper()
+            code = _SENDKEY_ALIASES.get(token)
+            if code is None:
+                return None
+            if token in {"CTRL", "CONTROL", "SHIFT"}:
+                modifiers.append(code)
+            else:
+                key = code
+            pos = end + 1
+            continue
+
+        char = text[pos]
+        if char.strip():
+            code = _SENDKEY_CHAR_MAP.get(char.lower())
+            if code is None:
+                return None
+            key = code
+        pos += 1
+
+    if key is None:
+        return None
+    return modifiers, key
+
+
+def _send_uia_keys(text: str) -> bool:
+    parsed = _parse_uia_send_keys(text)
+    if parsed is None:
+        return False
+    modifiers, key = parsed
+    for modifier in modifiers:
+        _simulate_key_event(_MACOS_KEY_MAP.get(modifier, modifier), True)
+        time.sleep(0.03)
+    _simulate_key_event(_MACOS_KEY_MAP.get(key, key), True)
+    time.sleep(0.03)
+    _simulate_key_event(_MACOS_KEY_MAP.get(key, key), False)
+    for modifier in reversed(modifiers):
+        time.sleep(0.03)
+        _simulate_key_event(_MACOS_KEY_MAP.get(modifier, modifier), False)
+    time.sleep(0.1)
+    return True
+
+
 # ---- macOS CGWindowList 窗口查找 ----
 
 def _find_wechat_window_cgid() -> Optional[int]:
@@ -857,7 +1058,7 @@ class MacOSWindowManager(WindowManager):
     def find_wechat_window(self) -> Optional[int]:
         # 优先用 CGWindowList 检测进程（不需要 AX 权限）
         cgid = _find_wechat_window_cgid()
-        if cgid and _AX_AVAILABLE:
+        if cgid and _can_use_ax():
             # 同时获取 AX 窗口元素用于后续 UI 操作
             window = _find_wechat_window_element()
             if window:
@@ -876,8 +1077,7 @@ class MacOSWindowManager(WindowManager):
         element = _get_window_element(hwnd)
         if element is not None:
             return _ax_perform_action(element, "AXRaise")
-        # 尝试通过 CGWindowID 激活
-        # 使用 AppleScript 激活微信
+        # 尝试通过 CGWindowID 激活，使用 AppleScript 激活微信
         try:
             script = '''
             tell application "WeChat"
@@ -893,6 +1093,9 @@ class MacOSWindowManager(WindowManager):
         element = _get_window_element(hwnd)
         if element is not None:
             return _ax_get_title(element)
+        info = _get_cg_window_info(_get_window_cgid(hwnd) or 0)
+        if info:
+            return str(info.get("kCGWindowName") or "")
         return ""
 
     def get_class(self, hwnd: int) -> str:
@@ -900,6 +1103,9 @@ class MacOSWindowManager(WindowManager):
         element = _get_window_element(hwnd)
         if element is not None:
             return _ax_get_role(element)
+        info = _get_cg_window_info(_get_window_cgid(hwnd) or 0)
+        if info:
+            return str(info.get("kCGWindowOwnerName") or "MainWindow")
         return "MainWindow"  # 默认值兼容微信检测逻辑
 
     def is_visible(self, hwnd: int) -> bool:
@@ -917,6 +1123,9 @@ class MacOSWindowManager(WindowManager):
                     return size[0] > 0 and size[1] > 0
             except Exception:
                 pass
+        cgid = _get_window_cgid(hwnd)
+        if cgid:
+            return _get_cg_window_info(cgid) is not None
         # 通过 CGWindowList 检查
         pid = _find_wechat_pid()
         return pid is not None
@@ -964,7 +1173,7 @@ class MacOSAutomation(AutomationEngine):
         if element is not None:
             return PlatformControl(self, element)
         # 如果 hwnd 是 CGWindowID，尝试通过 AX 获取
-        if _PYOBJC_AVAILABLE:
+        if _can_use_ax():
             pid = _find_wechat_pid()
             if pid:
                 try:
@@ -993,7 +1202,11 @@ class MacOSAutomation(AutomationEngine):
         if control_type and control_type != "Control":
             # 去除 Control 后缀
             clean_type = control_type.replace("Control", "")
-            ax_role = f"AX{clean_type}"
+            ax_role = _UIA_TO_AX_ROLES.get(clean_type, (f"AX{clean_type}",))
+
+        if class_name and class_name.startswith("AX"):
+            ax_role = (class_name,)
+            class_name = None
 
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -1002,6 +1215,7 @@ class MacOSAutomation(AutomationEngine):
                 role=ax_role,
                 title=name,
                 description_contains=class_name,
+                automation_id=automation_id,
                 max_depth=search_depth,
                 max_results=1,
             )
@@ -1021,16 +1235,22 @@ class MacOSAutomation(AutomationEngine):
         ax_role = None
         if control_type and control_type != "Control":
             clean_type = control_type.replace("Control", "")
-            ax_role = f"AX{clean_type}"
+            ax_role = _UIA_TO_AX_ROLES.get(clean_type, (f"AX{clean_type}",))
 
         desc = filters.get("class_name") or filters.get("ClassName")
         name = filters.get("name") or filters.get("Name")
+        automation_id = filters.get("automation_id") or filters.get("AutomationId")
+
+        if desc and str(desc).startswith("AX"):
+            ax_role = (str(desc),)
+            desc = None
 
         results = _ax_find_descendants(
             root._native,
             role=ax_role,
             title=name,
             description_contains=desc,
+            automation_id=automation_id,
             max_depth=search_depth or 10,
         )
         return [PlatformControl(self, r) for r in results]
@@ -1126,14 +1346,14 @@ _MACOS_KEY_MAP = {
     InputSimulator.VK_DELETE: 0x33,
     InputSimulator.VK_ESCAPE: 0x35,
     InputSimulator.VK_SHIFT: 0x38,    # Left Shift
-    InputSimulator.VK_CONTROL: 0x3B,  # Left Control
+    InputSimulator.VK_CONTROL: 0x37,  # Command，保持跨平台 Ctrl+X 语义
     InputSimulator.VK_A: 0x00,
     InputSimulator.VK_C: 0x08,
     InputSimulator.VK_F: 0x03,
     InputSimulator.VK_V: 0x09,
 }
 
-_MACOS_CONTROL = 0x3B
+_MACOS_COMMAND = 0x37
 
 
 class MacOSInput(InputSimulator):
@@ -1148,8 +1368,7 @@ class MacOSInput(InputSimulator):
         _simulate_key_event(mac_code, False)
 
     def send_combo(self, modifier: int, key: int, settle_time: float = 0.3) -> None:
-        # macOS: Command 键对应 _MACOS_CONTROL
-        # 但组合键通常是 Cmd+key，这里用 CGEvent 的 flags
+        # macOS 上将跨平台 Ctrl+key 语义映射为 Command+key。
         if not _PYOBJC_AVAILABLE:
             return
         self.key_down(modifier)
@@ -1313,6 +1532,12 @@ class MacOSProcess(ProcessManager):
                 pid_val = _ax_get_attr(element, "AXProcessIdentifier")
                 if pid_val:
                     return int(pid_val)
+            except Exception:
+                pass
+        info = _get_cg_window_info(_get_window_cgid(hwnd) or 0)
+        if info:
+            try:
+                return int(info.get("kCGWindowOwnerPID") or 0)
             except Exception:
                 pass
         return _find_wechat_pid() or 0

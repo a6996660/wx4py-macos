@@ -32,3 +32,7 @@ SEND_AUDIT_LOG_FILE = os.environ.get(
     "WECHAT_SEND_AUDIT_LOG_FILE",
     str(Path.cwd() / "wx4py_send_audit.jsonl"),
 )
+GROUP_MENTION_LOG_ROOT = os.environ.get(
+    "WECHAT_GROUP_MENTION_LOG_ROOT",
+    str(Path.cwd() / "logs" / "group_mentions"),
+)
