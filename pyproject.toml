@@ -8,12 +8,11 @@ license = {text = "AGPL-3.0-or-later"}
 authors = [
     {name = "claw-codes"}
 ]
-keywords = ["wx4py", "wechat", "automation", "uiautomation"]
+keywords = ["wx4py", "wechat", "macos", "automation", "ai-bot"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
-    "Operating System :: Microsoft :: Windows",
     "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -23,10 +22,8 @@ classifiers = [
 ]
 
 dependencies = [
-    "pywin32>=305; sys_platform == 'win32'",
-    "comtypes>=1.2.0; sys_platform == 'win32'",
-    "pyobjc-framework-Quartz>=8.0; sys_platform == 'darwin'",
-    "pyobjc-framework-Cocoa>=8.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=8.0",
+    "pyobjc-framework-Cocoa>=8.0",
     "pyperclip",
     "markdown",
     "beautifulsoup4",

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -36,20 +38,12 @@ def _single_instance_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = lock_path.open("w", encoding="utf-8")
     try:
-        if os.name == "nt":
-            import msvcrt
+        import fcntl
 
-            try:
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError as exc:
-                raise RuntimeError("检测到已有机器人进程在运行，请先停止旧进程。") from exc
-        else:
-            import fcntl
-
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                raise RuntimeError("检测到已有机器人进程在运行，请先停止旧进程。") from exc
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeError("检测到已有机器人进程在运行，请先停止旧进程。") from exc
         lock_file.seek(0)
         lock_file.truncate()
         lock_file.write(str(os.getpid()))
@@ -57,17 +51,37 @@ def _single_instance_lock(lock_path: Path):
         yield
     finally:
         try:
-            if os.name == "nt":
-                import msvcrt
+            import fcntl
 
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         finally:
             lock_file.close()
+
+
+@contextmanager
+def _prevent_system_sleep():
+    """macOS 下阻止息屏/睡眠，保证微信自动化可持续点击和发送。"""
+    process = None
+    if sys.platform == "darwin":
+        caffeinate = shutil.which("caffeinate")
+        if caffeinate:
+            try:
+                process = subprocess.Popen(
+                    [caffeinate, "-dimsu", "-w", str(os.getpid())],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                process = None
+    try:
+        yield process is not None
+    finally:
+        if process and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
 
 
 def _config_path() -> Path:
@@ -94,8 +108,8 @@ def _load_groups(config: Dict[str, Any]) -> list[str]:
 
 
 def _load_reply_delay_range(config: Dict[str, Any]) -> Tuple[float, float]:
-    """读取自动回复随机延迟范围，默认 5 到 18 秒。"""
-    value = config.get("reply_delay_range", [5, 18])
+    """读取自动回复随机延迟范围，默认 2 到 5 秒。"""
+    value = config.get("reply_delay_range", [2, 5])
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         raise ValueError("reply_delay_range 必须是两个数字，例如 [5, 18]。")
     start, end = float(value[0]), float(value[1])
@@ -153,48 +167,56 @@ def main() -> None:
     config_file = _config_path()
     try:
         with _single_instance_lock(_lock_path(config_file)):
-            raw_config = _load_raw_config(config_file)
-            groups = _load_groups(raw_config)
-            reply_delay_range = _load_reply_delay_range(raw_config)
-            ai_queue_size = _load_ai_queue_size(raw_config)
-            ai_context_size = _load_ai_context_size(raw_config)
-            ai_max_reply_chars = _load_ai_max_reply_chars(raw_config)
-            group_log_root = _configure_group_log_root(raw_config)
-            error_log_root = _configure_error_log_root(raw_config)
+            with _prevent_system_sleep() as sleep_prevented:
+                raw_config = _load_raw_config(config_file)
+                groups = _load_groups(raw_config)
+                reply_delay_range = _load_reply_delay_range(raw_config)
+                ai_queue_size = _load_ai_queue_size(raw_config)
+                ai_context_size = _load_ai_context_size(raw_config)
+                ai_max_reply_chars = _load_ai_max_reply_chars(raw_config)
+                group_log_root = _configure_group_log_root(raw_config)
+                error_log_root = _configure_error_log_root(raw_config)
 
-            # AIConfig.from_file 会读取 providers/default，并支持环境变量覆盖。
-            ai = AIClient(AIConfig.from_file(str(config_file)))
+                # AIConfig.from_file 会读取 providers/default，并支持环境变量覆盖。
+                ai = AIClient(AIConfig.from_file(str(config_file)))
 
-            print(f"配置文件: {config_file}")
-            print(f"监听群聊: {', '.join(groups)}")
-            print(f"回复随机延迟: {reply_delay_range[0]:.1f} - {reply_delay_range[1]:.1f} 秒")
-            print(f"大模型消息队列: {'不限制' if ai_queue_size == 0 else ai_queue_size}")
-            print(f"同群上下文长度: {ai_context_size}")
-            print(f"单条回复上限: {ai_max_reply_chars} 字")
-            print(f"群聊审计日志: {group_log_root}")
-            print(f"关键错误日志: {error_log_root}")
-            print(f"单实例锁: {_lock_path(config_file)}")
-            print("启动中：只有被 @ 时才会调用大模型回复。按 Ctrl+C 停止。")
+                print(f"配置文件: {config_file}")
+                print(f"监听群聊: {', '.join(groups)}")
+                print(f"回复随机延迟: {reply_delay_range[0]:.1f} - {reply_delay_range[1]:.1f} 秒")
+                print(f"大模型消息队列: {'不限制' if ai_queue_size == 0 else ai_queue_size}")
+                print(f"同群上下文长度: {ai_context_size}")
+                print(f"单条回复上限: {ai_max_reply_chars} 字")
+                print(f"群聊审计日志: {group_log_root}")
+                print(f"关键错误日志: {error_log_root}")
+                print(f"单实例锁: {_lock_path(config_file)}")
+                print(f"阻止系统睡眠: {'已启用 caffeinate' if sleep_prevented else '未启用'}")
+                print("启动中：只有被 @ 时才会调用大模型回复。按 Ctrl+C 停止。")
 
-            with WeChatClient(auto_connect=True) as wx:
-                wx.process_groups(
-                    groups,
-                    [
-                        AsyncCallbackHandler(
-                            AIResponder(
-                                ai,
-                                context_size=ai_context_size,
+                with WeChatClient(auto_connect=True) as wx:
+                    responder = AIResponder(
+                        ai,
+                        context_size=ai_context_size,
+                        reply_on_at=True,
+                        max_reply_chars=ai_max_reply_chars,
+                    )
+                    loaded_context = responder.seed_context_from_group_logs(
+                        groups,
+                        log_root=group_log_root,
+                    )
+                    print(f"已从群聊审计日志恢复上下文消息: {loaded_context} 条")
+                    wx.process_groups(
+                        groups,
+                        [
+                            AsyncCallbackHandler(
+                                responder,
+                                auto_reply=True,
                                 reply_on_at=True,
-                                max_reply_chars=ai_max_reply_chars,
-                            ),
-                            auto_reply=True,
-                            reply_on_at=True,
-                            queue_size=ai_queue_size,
-                        )
-                    ],
-                    reply_delay_range=reply_delay_range,
-                    block=True,
-                )
+                                queue_size=ai_queue_size,
+                            )
+                        ],
+                        reply_delay_range=reply_delay_range,
+                        block=True,
+                    )
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(2)

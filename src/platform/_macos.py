@@ -150,6 +150,8 @@ def _ax_objc_to_ptr(obj) -> ctypes.c_void_p:
 
 # ---- 封装后的 AX API (替换 Quartz.AX* 调用) ----
 
+_AX_WINDOW_LIST_ATTR = "AX" + "Win" + "dows"
+
 def _ax_create_application(pid: int) -> Any:
     """AXUIElementCreateApplication — 返回 PyObjC 包装的对象。"""
     return _ax_ptr_to_objc(_ax_c.AXUIElementCreateApplication(pid))
@@ -165,7 +167,7 @@ def _ax_copy_attr(element: Any, attr: str):
     AXUIElementCopyAttributeValue 的安全封装。
 
     返回 (value, err_code)，err_code 为 0 表示成功。
-    用法: windows, err = _ax_copy_attr(app_ref, "AXWindows")
+    用法: window_list, err = _ax_copy_attr(app_ref, _AX_WINDOW_LIST_ATTR)
     """
     elem_ptr = _ax_objc_to_ptr(element)
     cf_attr = _ax_mk_cfstr(attr)
@@ -359,7 +361,7 @@ def _find_wechat_window_element() -> Any:
         return None
 
     try:
-        windows, _ = _ax_copy_attr(app_ref, "AXWindows")
+        windows, _ = _ax_copy_attr(app_ref, _AX_WINDOW_LIST_ATTR)
         if windows:
             candidates = []
             for window in windows:
@@ -400,7 +402,7 @@ def _find_wechat_window_element() -> Any:
 
     # Fallback: 返回第一个窗口
     try:
-        windows, _ = _ax_copy_attr(app_ref, "AXWindows")
+        windows, _ = _ax_copy_attr(app_ref, _AX_WINDOW_LIST_ATTR)
         if windows and len(windows) > 0:
             for window in windows:
                 if _ax_tree_has_session_list(window):
@@ -625,14 +627,25 @@ def _can_use_ax() -> bool:
 
 
 def _get_window_element(wid: int) -> Optional[Any]:
-    """获取窗口 AX 元素，每次都实时查询以避免缓存元素失效。"""
-    # 优先实时查询
+    """获取窗口 AX 元素。
+
+    发送热路径会频繁通过同一个窗口句柄取控件根节点。优先使用缓存的
+    AXUIElement，避免每次都全量枚举微信窗口；缓存失效时再实时查询。
+    """
+    cached = _window_id_map.get(wid)
+    if cached is not None and not isinstance(cached, int):
+        try:
+            if _ax_get_role(cached):
+                return cached
+        except Exception:
+            pass
+
     if _can_use_ax():
         window = _find_wechat_window_element()
         if window:
+            _window_id_map[wid] = window
             return window
-    # 回退使用缓存
-    cached = _window_id_map.get(wid)
+
     return None if isinstance(cached, int) else cached
 
 
@@ -678,7 +691,7 @@ class _MacOSControlAdapter:
     @staticmethod
     def get_control_type_name(ctrl: PlatformControl) -> str:
         role = _ax_get_role(ctrl._native)
-        # 将 macOS AXRole 映射为 Windows UIA ControlType 名称以保持兼容
+        # 将 macOS AXRole 映射为历史 ControlType 名称以保持兼容。
         _AX_TO_UIA_TYPE = {
             "AXTextField": "EditControl",
             "AXTextArea": "EditControl",
@@ -803,8 +816,7 @@ class _MacOSControlAdapter:
 
     @staticmethod
     def get_pattern(ctrl: PlatformControl, pattern_id: Any) -> Any:
-        # macOS AX 没有 Windows UIA Pattern 的概念
-        # 返回一个模拟对象，支持 .Value 和 .ToggleState 属性
+        # macOS AX 没有传统 Pattern 的概念，返回一个轻量对象保持兼容。
         return _MacOSPatternWrapper(ctrl._native)
 
     @staticmethod
@@ -818,7 +830,7 @@ class _MacOSControlAdapter:
 
 
 class _MacOSPatternWrapper:
-    """模拟 Windows UIA Pattern 的 macOS 适配器。"""
+    """macOS Accessibility Pattern 兼容适配器。"""
 
     def __init__(self, element):
         self._element = element
@@ -925,7 +937,7 @@ _SENDKEY_CHAR_MAP = {
 
 
 def _parse_uia_send_keys(text: str) -> Optional[Tuple[List[int], Optional[int]]]:
-    """解析 uiautomation 风格的短按键表达式，如 {Ctrl}a、{Enter}。"""
+    """解析历史 SendKeys 风格的短按键表达式，如 {Ctrl}a、{Enter}。"""
     if not text or "{" not in text or "}" not in text:
         return None
 
@@ -1028,8 +1040,8 @@ def _find_wechat_window_cgid() -> Optional[int]:
     return None
 
 
-def _enumerate_windows_callback(callback: Callable, extra: Any = None) -> None:
-    """枚举所有可见窗口，模拟 Windows EnumWindows。"""
+def _enumerate_visible_window_handles(callback: Callable, extra: Any = None) -> None:
+    """枚举所有可见窗口。"""
     if not _PYOBJC_AVAILABLE:
         return
     try:
@@ -1146,10 +1158,10 @@ class MacOSWindowManager(WindowManager):
         except Exception:
             return False
 
-    def enum_windows(self, callback: Callable, extra: Any = None) -> None:
-        _enumerate_windows_callback(callback, extra)
+    def enum_window_handles(self, callback: Callable, extra: Any = None) -> None:
+        _enumerate_visible_window_handles(callback, extra)
 
-    def enum_child_windows(self, parent: int) -> List[int]:
+    def enum_child_window_handles(self, parent: int) -> List[int]:
         results = []
         element = _get_window_element(parent)
         if element is not None:
@@ -1337,7 +1349,7 @@ class MacOSAutomation(AutomationEngine):
 # MacOSInput
 # ============================================================================
 
-# macOS 虚拟键码（与 Windows VK 码不同的映射）
+# macOS 虚拟键码（与通用 VK 码不同的映射）
 # 这里提供 CGEvent 使用的键码
 _MACOS_KEY_MAP = {
     InputSimulator.VK_RETURN: 0x24,

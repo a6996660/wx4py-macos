@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
-"""微信群聊监听与自动回复。
+"""macOS 微信群聊监听与自动回复。
 
-该模块按平台使用不同监听策略：
-1. Windows 端可以使用独立聊天窗口和 ``chat_message_list`` 轮询。
-2. macOS 端只监听左侧会话列表的 ``[有人@我]`` 预览，避免主窗口单聊天区在多群间串读。
-3. 自动回复统一进入串行发送队列，发送前再切换目标群。
-4. 自动回复时记录本库发送的消息，监听回流时只忽略一次。
+监听策略固定为读取左侧会话列表的 ``[有人@我]`` 预览，不搜索群名，
+不把当前聊天区作为多群消息来源。自动回复统一进入串行发送队列，
+发送前再切换目标群，并在发送后确认回复出现在消息列表中。
 
 注意：
     微信 4.x 的 Qt UIA 对消息方向/发送者暴露不足，无法稳定识别用户手动
@@ -14,7 +12,6 @@
 
 from __future__ import annotations
 
-import os
 import queue
 import random
 import re
@@ -30,7 +27,6 @@ from ...utils.logger import get_logger, log_error_audit
 
 logger = get_logger(__name__)
 
-WECHAT_EXE_NAMES = {"wechat.exe", "weixin.exe"}
 MESSAGE_CLASSES = {
     "mmui::ChatTextItemView",
     "mmui::ChatBubbleItemView",
@@ -39,6 +35,14 @@ TIME_CLASS = "mmui::ChatItemView"
 MACOS_MESSAGE_AUTOMATION_ID = "chat_bubble_item_view"
 MACOS_SESSION_ITEM_PREFIX = "session_item_"
 DEFAULT_REPLY_DELAY_RANGE = (3.0, 9.0)
+SEND_ATTEMPT_LIMIT = 3
+GROUP_SWITCH_ATTEMPT_LIMIT = 3
+GROUP_SWITCH_WAIT_SECONDS = 0.8
+SEND_VERIFY_TIMEOUT = 0.8
+RECOVERY_PAUSE_SECONDS = 0.25
+GROUP_SWITCH_FALLBACK_ACCEPT_SECONDS = 0.2
+DETACHED_WINDOW_CHECK_INTERVAL = 0.25
+QUICK_EXISTS_TIMEOUT = 0.08
 
 _CURRENT_ACCOUNT_NICKNAME: Optional[str] = None
 _CURRENT_ACCOUNT_NICKNAME_LOCK = threading.Lock()
@@ -196,9 +200,6 @@ def _get_current_account_nickname(root=None) -> Optional[str]:
     with _CURRENT_ACCOUNT_NICKNAME_LOCK:
         if _CURRENT_ACCOUNT_NICKNAME:
             return _CURRENT_ACCOUNT_NICKNAME
-        if platform.platform_name != "darwin":
-            return None
-
         nickname = _read_current_account_nickname_macos(root)
         if nickname:
             _CURRENT_ACCOUNT_NICKNAME = nickname
@@ -223,7 +224,7 @@ def _read_current_account_nickname_macos(root=None) -> Optional[str]:
         time.sleep(0.6)
 
         app_ref = _macos._get_wechat_app_ref()
-        windows, _ = _macos._ax_copy_attr(app_ref, "AXWindows")
+        windows, _ = _macos._ax_copy_attr(app_ref, _macos._AX_WINDOW_LIST_ATTR)
         for window in list(windows or []):
             title = _macos._ax_get_title(window)
             pos = _macos._ax_get_position(window)
@@ -282,45 +283,11 @@ def _extract_profile_nickname_from_ax(element, macos_module) -> Optional[str]:
     return fallback
 
 
-def _get_process_image_name(pid: int) -> str:
-    """通过 pid 获取进程路径。"""
-    return platform.process.get_process_name(pid)
-
-
-def _find_wechat_windows() -> List[Tuple[int, str, str]]:
-    windows: List[Tuple[int, str, str]] = []
-
-    def callback(hwnd: int, _lparam: int) -> bool:
-        try:
-            pid = platform.process.get_window_pid(hwnd)
-            exe_name = os.path.basename(_get_process_image_name(pid)).lower()
-            title = platform.window_manager.get_title(hwnd) or ""
-            class_name = platform.window_manager.get_class(hwnd) or ""
-        except Exception:
-            return True
-
-        if exe_name in WECHAT_EXE_NAMES and platform.window_manager.is_visible(hwnd):
-            windows.append((hwnd, title, class_name))
-        return True
-
-    platform.window_manager.enum_windows(callback, 0)
-    return windows
-
-
-def _find_window_by_title(title_keyword: str, exclude_hwnd: Optional[int] = None) -> Optional[int]:
-    for hwnd, title, _class_name in _find_wechat_windows():
-        if hwnd == exclude_hwnd:
-            continue
-        if title_keyword in title:
-            return hwnd
-    return None
-
-
 def _find_message_list(root):
     """查找聊天消息列表。"""
     try:
         msg_list = root.ListControl(AutomationId="chat_message_list")
-        if msg_list.Exists(maxSearchSeconds=1):
+        if msg_list.Exists(maxSearchSeconds=QUICK_EXISTS_TIMEOUT):
             return msg_list
     except Exception:
         pass
@@ -380,7 +347,7 @@ def _find_session_list(root):
     """查找微信左侧会话列表。"""
     try:
         session_list = root.ListControl(AutomationId="session_list")
-        if session_list.Exists(maxSearchSeconds=1):
+        if session_list.Exists(maxSearchSeconds=QUICK_EXISTS_TIMEOUT):
             return session_list
     except Exception:
         pass
@@ -450,6 +417,143 @@ def _find_session_item(root, group_name: str):
         return None
     candidates.sort(key=lambda item: (item[0], -item[1]), reverse=True)
     return candidates[0][2]
+
+
+def _normalize_chat_title(text: str) -> str:
+    """归一化微信聊天标题，去掉群人数后缀等展示噪声。"""
+    text = _normalize_message_text(text)
+    text = re.sub(r"\s*[（(]\d+[)）]\s*$", "", text)
+    return text.strip()
+
+
+def _current_chat_title_matches(root, group_name: str) -> bool:
+    """快速判断当前聊天标题是否已经是目标群，避免重复点击左侧会话。
+
+    只扫描窗口顶部标题区域。不要在发送热路径里全量遍历控件树，否则
+    macOS 微信 AX 偶尔会把一次切群确认拖到几十秒。
+    """
+    expected = _normalize_chat_title(group_name)
+    if not expected:
+        return False
+
+    try:
+        root_rect = root.BoundingRectangle
+    except Exception:
+        root_rect = None
+
+    if not root_rect:
+        return False
+
+    try:
+        for control, _depth in platform.automation.walk_control(root, include_top=True, max_depth=3):
+            name = _normalize_chat_title(_safe_text(control, "Name"))
+            if name != expected:
+                continue
+            try:
+                rect = control.BoundingRectangle
+            except Exception:
+                continue
+
+            in_header = rect.top <= root_rect.top + 120
+            in_main_title_area = rect.left >= root_rect.left + 220
+            in_detached_title_area = rect.left >= root_rect.left + 12
+            if in_header and (in_main_title_area or in_detached_title_area):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _get_wechat_ax_windows():
+    try:
+        from ...platform import _macos
+    except Exception:
+        return None, []
+
+    try:
+        app_ref = _macos._get_wechat_app_ref()
+        if not app_ref:
+            return _macos, []
+        windows, _ = _macos._ax_copy_attr(app_ref, _macos._AX_WINDOW_LIST_ATTR)
+        return _macos, list(windows or [])
+    except Exception:
+        return _macos, []
+
+
+def _close_ax_window(macos_module, window) -> bool:
+    if macos_module._ax_perform_action(window, "AXClose"):
+        return True
+
+    try:
+        buttons = macos_module._ax_find_descendants(window, role="AXButton", max_depth=4)
+        for button in buttons:
+            subrole = str(macos_module._ax_get_attr(button, "AXSubrole") or "")
+            title = macos_module._ax_get_title(button)
+            desc = macos_module._ax_get_description(button)
+            if subrole == "AXCloseButton" or "关闭" in f"{title} {desc}":
+                if macos_module._ax_perform_action(button, "AXPress"):
+                    return True
+    except Exception:
+        pass
+
+    try:
+        pos = macos_module._ax_get_position(window)
+        if pos:
+            platform.input.mouse_click(int(pos[0] + 14), int(pos[1] + 14))
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _close_detached_group_windows(group_name: str, expected_message: str = "") -> Tuple[bool, bool]:
+    """关闭目标群独立聊天窗口。
+
+    Returns:
+        (是否关闭过窗口, 是否确认过回复可见；当前不做深度确认，恒为 False)
+    """
+    macos_module, windows = _get_wechat_ax_windows()
+    if not macos_module:
+        return False, False
+
+    closed = False
+    message_visible = False
+    expected_title = _normalize_chat_title(group_name)
+    for window in windows:
+        try:
+            title = _normalize_chat_title(macos_module._ax_get_title(window))
+            if title != expected_title:
+                continue
+            if _close_ax_window(macos_module, window):
+                closed = True
+                logger.warning("已自动关闭目标群独立聊天窗口: %s", group_name)
+        except Exception as exc:
+            logger.debug("关闭独立聊天窗口失败: %s: %s", group_name, exc)
+    if closed:
+        time.sleep(0.4)
+    return closed, message_visible
+
+
+def _get_detached_group_root(group_name: str):
+    """获取目标群独立聊天窗口的控件根节点；没有则返回 None。"""
+    macos_module, windows = _get_wechat_ax_windows()
+    if not macos_module:
+        return None
+
+    expected_title = _normalize_chat_title(group_name)
+    for window in windows:
+        try:
+            title = _normalize_chat_title(macos_module._ax_get_title(window))
+            if title != expected_title:
+                continue
+            macos_module._ax_perform_action(window, "AXRaise")
+            wid = macos_module._register_window(window)
+            root = platform.automation.control_from_handle(wid)
+            if root:
+                return root
+        except Exception as exc:
+            logger.debug("获取独立聊天窗口失败: %s: %s", group_name, exc)
+    return None
 
 
 def _session_item_has_at_me(control) -> bool:
@@ -551,11 +655,9 @@ def _click_control(control) -> bool:
 
 def _click_session_item(control) -> bool:
     """macOS 会话列表使用坐标单击，避免 AX Invoke 被微信解释为打开独立窗口。"""
-    if platform.platform_name != "darwin":
-        return _click_control(control)
     try:
         rect = control.BoundingRectangle
-        x = rect.left + min(90, max(30, (rect.right - rect.left) // 3))
+        x = rect.left + min(42, max(28, (rect.right - rect.left) // 7))
         y = (rect.top + rect.bottom) // 2
         platform.input.mouse_click(x, y)
         return True
@@ -595,21 +697,6 @@ def _dismiss_send_failure_dialog(root=None) -> bool:
     return False
 
 
-def _double_click_control(control) -> bool:
-    try:
-        control.DoubleClick(simulateMove=False)
-        return True
-    except Exception:
-        pass
-
-    try:
-        rect = control.BoundingRectangle
-        x = (rect.left + rect.right) // 2
-        y = (rect.top + rect.bottom) // 2
-        platform.input.mouse_dblclick(x, y)
-        return True
-    except Exception:
-        return False
 class WeChatGroupListener:
     """微信群聊监听器。"""
 
@@ -648,6 +735,9 @@ class WeChatGroupListener:
         self._thread: Optional[threading.Thread] = None
         self._sender_thread: Optional[threading.Thread] = None
         self._current_send_group: Optional[str] = None
+        self._current_send_group_at = 0.0
+        self._current_send_surface_detached = False
+        self._last_verify_closed_detached = False
 
     @property
     def is_running(self) -> bool:
@@ -691,160 +781,27 @@ class WeChatGroupListener:
             if group in self.sessions:
                 continue
 
-            chat_already_open = False
-            if (
-                self.reply_on_at
-                and platform.platform_name != "darwin"
-                and not self.group_nicknames.get(group)
-            ):
-                chat_already_open = self._read_group_nickname(group)
-            elif self.reply_on_at and platform.platform_name == "darwin" and not self.group_nicknames.get(group):
+            if self.reply_on_at and not self.group_nicknames.get(group):
                 nickname = _get_current_account_nickname(self.client.window.uia.root)
                 if nickname:
                     self.group_nicknames[group] = nickname
 
-            if platform.platform_name == "darwin":
-                root = platform.automation.control_from_handle(self.client.window.hwnd)
-                session_item = _find_session_item(root, group)
-                if not session_item:
-                    raise RuntimeError(f"左侧会话列表未找到群聊，macOS 监听不会回退搜索: {group}")
-                has_startup_at_hint = _session_item_has_at_me(session_item)
-                self.sessions[group] = _ListenSession(
-                    group=group,
-                    hwnd=self.client.window.hwnd,
-                    root=root,
-                    msg_list=None,
-                    seen=set(),
-                    seen_texts=set(),
-                    at_hint_pending=has_startup_at_hint,
-                    at_hint_sender=_extract_sender_from_session_item(session_item, group),
-                    suppress_next_scan=has_startup_at_hint,
-                )
-                continue
-
-            hwnd = self._ensure_subwindow(group, chat_already_open=chat_already_open)
-            root, msg_list = self._wait_for_message_list(hwnd, group)
-            if not msg_list:
-                raise RuntimeError(f"未找到群聊消息列表: {group}")
-            baseline = _read_visible_items(msg_list)
-            session_item = _find_session_item(self.client.window.uia.root, group)
+            root = platform.automation.control_from_handle(self.client.window.hwnd)
+            session_item = _find_session_item(root, group)
+            if not session_item:
+                raise RuntimeError(f"左侧会话列表未找到群聊，macOS 监听不会回退搜索: {group}")
+            has_startup_at_hint = _session_item_has_at_me(session_item)
             self.sessions[group] = _ListenSession(
                 group=group,
-                hwnd=hwnd,
+                hwnd=self.client.window.hwnd,
                 root=root,
-                msg_list=msg_list,
-                seen={item.key for item in baseline},
-                seen_texts={
-                    _normalize_message_text(item.name)
-                    for item in baseline
-                    if item.kind == "message" and _normalize_message_text(item.name)
-                },
-                at_hint_pending=_session_item_has_at_me(session_item) if session_item else False,
-                at_hint_sender=_extract_sender_from_session_item(session_item, group) if session_item else None,
+                msg_list=None,
+                seen=set(),
+                seen_texts=set(),
+                at_hint_pending=has_startup_at_hint,
+                at_hint_sender=_extract_sender_from_session_item(session_item, group),
+                suppress_next_scan=has_startup_at_hint,
             )
-
-    def _wait_for_message_list(self, hwnd: int, group: str, timeout: float = 15.0):
-        """等待目标群聊的消息列表出现。
-
-        macOS 上点击头像读取昵称后，资料卡关闭和会话切换都有短暂异步刷新；
-        因此这里需要轮询，并在必要时重新点击左侧群会话项。
-        """
-        deadline = time.time() + timeout
-        root = None
-        msg_list = None
-        clicked_at = 0.0
-        while time.time() < deadline:
-            root = platform.automation.control_from_handle(hwnd)
-            if platform.platform_name == "darwin":
-                session_item = _find_session_item(root, group)
-                if session_item and not clicked_at:
-                    _click_session_item(session_item)
-                    clicked_at = time.time()
-                    time.sleep(0.2)
-                    root = platform.automation.control_from_handle(hwnd)
-
-            msg_list = _find_message_list(root)
-            if msg_list:
-                return root, msg_list
-            time.sleep(0.3)
-        if platform.platform_name == "darwin":
-            try:
-                session_item = _find_session_item(root, group) if root else None
-                logger.warning(
-                    "等待 macOS 群聊消息列表超时: group=%s, session_item=%s, session_name=%s",
-                    group,
-                    bool(session_item),
-                    _safe_text(session_item, "Name")[:120] if session_item else "",
-                )
-            except Exception:
-                pass
-        return root, msg_list
-
-    def _read_group_nickname(self, group: str) -> bool:
-        """读取群昵称。
-
-        ``GroupManager.get_group_nickname`` 本身会打开目标群聊并进入详情面板。
-        返回 True 表示当前主窗口大概率已经停留在该群聊，可直接双击左侧会话项
-        打开独立窗口，避免再次搜索同一个群。
-        """
-        try:
-            nickname = self.client.group_manager.get_group_nickname(group)
-        except Exception as exc:
-            logger.warning(f"读取群昵称失败: {group}: {exc}")
-            return False
-
-        if nickname:
-            self.group_nicknames[group] = nickname
-        else:
-            logger.warning(f"未读取到群昵称，无法精确判断是否 @ 我: {group}")
-        return True
-
-    def _ensure_subwindow(self, group: str, chat_already_open: bool = False) -> int:
-        main_hwnd = self.client.window.hwnd
-        if platform.platform_name == "darwin":
-            root = platform.automation.control_from_handle(main_hwnd)
-            item = _find_session_item(root, group)
-            if item and _click_session_item(item):
-                time.sleep(0.8)
-                return main_hwnd
-            raise RuntimeError(f"左侧会话列表未找到群聊，macOS 监听不会回退搜索: {group}")
-
-        hwnd = _find_window_by_title(group, exclude_hwnd=main_hwnd)
-        if hwnd:
-            return hwnd
-
-        item = _find_session_item(self.client.window.uia.root, group)
-        if item and _click_session_item(item):
-            time.sleep(0.5)
-        elif item:
-            logger.debug(f"左侧会话项点击失败，回退搜索打开群聊: {group}")
-
-        if not chat_already_open:
-            current_msg_list = _find_message_list(self.client.window.uia.root)
-            if not current_msg_list and not self.client.chat_window.open_chat(group, target_type="group"):
-                raise RuntimeError(f"打开群聊失败: {group}")
-            time.sleep(0.8)
-
-        item = _find_session_item(self.client.window.uia.root, group)
-        if not item and chat_already_open:
-            logger.debug(f"当前会话项未找到，重新搜索打开群聊: {group}")
-            if not self.client.chat_window.open_chat(group, target_type="group"):
-                raise RuntimeError(f"打开群聊失败: {group}")
-            time.sleep(0.8)
-            item = _find_session_item(self.client.window.uia.root, group)
-
-        if not item or not _double_click_control(item):
-            logger.warning(f"打开独立聊天窗口失败，复用当前主窗口监听: {group}")
-            return main_hwnd
-
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            hwnd = _find_window_by_title(group, exclude_hwnd=main_hwnd)
-            if hwnd:
-                return hwnd
-            time.sleep(0.2)
-        logger.warning(f"等待独立聊天窗口超时，复用当前主窗口监听: {group}")
-        return main_hwnd
 
     def _run_loop(self) -> None:
         logger.info(f"开始监听群聊: {', '.join(self.groups)}")
@@ -865,122 +822,49 @@ class WeChatGroupListener:
 
     def _poll_session(self, session: _ListenSession) -> None:
         session.scan_count += 1
-        at_hint = session.at_hint_pending
-        sender_nickname = session.at_hint_sender
         try:
             session_item = _find_session_item(self.client.window.uia.root, session.group)
-            if platform.platform_name == "darwin":
-                if session_item and not _session_item_matches_group(session_item, session.group):
-                    logger.warning(
-                        "忽略疑似错配会话项: expected=%s, automation_id=%s, name=%s",
-                        session.group,
-                        _safe_text(session_item, "AutomationId"),
-                        _safe_text(session_item, "Name")[:120],
-                    )
-                    session_item = None
-                if not session_item or not _session_item_has_at_me(session_item):
-                    session.at_hint_pending = False
-                    session.at_hint_sender = None
-                    self._update_next_scan(session, 0)
-                    return
-                sender_nickname = _extract_sender_from_session_item(session_item, session.group)
-                content = _extract_message_from_session_item(session_item, session.group)
-                if not content:
-                    self._update_next_scan(session, 0)
-                    return
-                normalized_text = _normalize_message_text(content)
+            if session_item and not _session_item_matches_group(session_item, session.group):
+                logger.warning(
+                    "忽略疑似错配会话项: expected=%s, automation_id=%s, name=%s",
+                    session.group,
+                    _safe_text(session_item, "AutomationId"),
+                    _safe_text(session_item, "Name")[:120],
+                )
+                session_item = None
+            if not session_item or not _session_item_has_at_me(session_item):
+                session.at_hint_pending = False
+                session.at_hint_sender = None
+                self._update_next_scan(session, 0)
+                return
+            sender_nickname = _extract_sender_from_session_item(session_item, session.group)
+            content = _extract_message_from_session_item(session_item, session.group)
+            if not content:
+                self._update_next_scan(session, 0)
+                return
+            normalized_text = _normalize_message_text(content)
+            if normalized_text:
                 if normalized_text in session.seen_texts:
                     self._update_next_scan(session, 0)
                     return
-                if normalized_text:
-                    session.seen_texts.add(normalized_text)
-                self._handle_text_message(
-                    session,
-                    content,
-                    sender_nickname=sender_nickname,
-                    at_hint=True,
-                )
-                session.at_hint_pending = False
-                session.at_hint_sender = None
-                self._update_next_scan(session, 1)
-                return
-
-            if session_item:
-                sender_nickname = _extract_sender_from_session_item(session_item, session.group) or sender_nickname
-            has_at_hint = bool(session_item and _session_item_has_at_me(session_item))
-            if platform.platform_name == "darwin" and not at_hint and not has_at_hint:
+                session.seen_texts.add(normalized_text)
+            if self.ignore_client_sent and self.outgoing_registry.should_ignore(session.group, content):
                 self._update_next_scan(session, 0)
                 return
-            if has_at_hint:
-                at_hint = True
-                sender_nickname = _extract_sender_from_session_item(session_item, session.group)
-                _click_session_item(session_item)
-                time.sleep(0.6)
-                session.root = platform.automation.control_from_handle(self.client.window.hwnd)
-                refreshed_msg_list = _find_message_list(session.root)
-                if refreshed_msg_list:
-                    session.msg_list = refreshed_msg_list
-            if not session.msg_list:
-                self._update_next_scan(session, 0)
-                return
-            items = _read_visible_items(session.msg_list)
-            if self.tail_size > 0:
-                items = items[-self.tail_size:]
+            self._handle_text_message(
+                session,
+                content,
+                sender_nickname=sender_nickname,
+                at_hint=True,
+            )
+            session.at_hint_pending = False
+            session.at_hint_sender = None
+            self._update_next_scan(session, 1)
+            return
         except Exception as exc:
             session.fail_count += 1
             logger.debug(f"读取群聊消息失败: {session.group}: {exc}")
             return
-
-        pending_messages: List[_VisibleItem] = []
-        for item in items:
-            if item.key in session.seen:
-                continue
-            session.seen.add(item.key)
-            if item.kind != "message":
-                continue
-            normalized_text = _normalize_message_text(item.name)
-            if normalized_text in session.seen_texts:
-                continue
-            if normalized_text:
-                session.seen_texts.add(normalized_text)
-            if self.ignore_client_sent and self.outgoing_registry.should_ignore(session.group, item.name):
-                continue
-            pending_messages.append(item)
-
-        if session.suppress_next_scan:
-            session.suppress_next_scan = False
-            if pending_messages:
-                logger.info(
-                    "macOS 群聊启动基线已刷新，忽略历史消息: %s, count=%s",
-                    session.group,
-                    len(pending_messages),
-                )
-            if at_hint:
-                session.at_hint_pending = False
-                session.at_hint_sender = None
-            self._update_next_scan(session, 0)
-            return
-
-        added = len(pending_messages)
-        for index, item in enumerate(pending_messages):
-            session.new_count += 1
-            event_sender = (
-                sender_nickname
-                if index == len(pending_messages) - 1 and (at_hint or self._is_at_me(session.group, item.name))
-                else None
-            )
-            self._handle_message(
-                session,
-                item,
-                at_hint=at_hint,
-                sender_nickname=event_sender,
-            )
-
-        if at_hint and pending_messages:
-            session.at_hint_pending = False
-            session.at_hint_sender = None
-
-        self._update_next_scan(session, added)
 
     def _handle_text_message(
         self,
@@ -1063,7 +947,7 @@ class WeChatGroupListener:
         session.next_scan_at = now + session.interval
 
     def reply(self, group: str, content: str) -> bool:
-        """立即使用对应独立窗口回复群聊。
+        """立即在微信主窗口回复群聊。
 
         注意：该方法会直接操作窗口、剪贴板和焦点。自动回复默认不直接调用它，
         而是进入发送队列，由单个 sender 线程串行发送，避免多个群同时回复时
@@ -1074,6 +958,8 @@ class WeChatGroupListener:
             raise ValueError(f"未监听群聊: {group}")
 
         self._sleep_before_reply(group, content)
+        if self._stop_event.is_set():
+            return False
 
         if self.ignore_client_sent:
             # 先登记，再发送，避免微信回流速度快于登记速度导致漏判。
@@ -1102,7 +988,7 @@ class WeChatGroupListener:
         logger.info(
             f"群聊回复随机等待 {delay:.2f} 秒: {group} -> {(content or '')[:30]}"
         )
-        time.sleep(delay)
+        self._stop_event.wait(delay)
         return delay
 
     def enqueue_reply(self, group: str, content: str) -> None:
@@ -1138,90 +1024,393 @@ class WeChatGroupListener:
             finally:
                 self._reply_queue.task_done()
 
-    def _send_in_subwindow(self, session: _ListenSession, content: str) -> bool:
-        if platform.platform_name == "darwin":
-            if self._current_send_group == session.group:
-                session.root = platform.automation.control_from_handle(self.client.window.hwnd)
-                if not self._find_chat_input(session.root):
-                    self._current_send_group = None
-            if self._current_send_group != session.group:
-                if not self._activate_group_for_send(session):
-                    return False
+    def _get_main_root(self):
+        """激活并获取微信主窗口控件根节点。"""
+        try:
+            self.client.window.activate()
+        except Exception as exc:
+            logger.debug(f"激活微信主窗口失败: {exc}")
 
-        root = session.root
-        edit = self._find_chat_input(root)
-        if not edit:
-            logger.error(f"未找到聊天输入框: {session.group}")
-            log_error_audit(
-                "chat_input_missing",
-                {"group": session.group, "reply": content},
-            )
-            return False
+        try:
+            return platform.automation.control_from_handle(self.client.window.hwnd)
+        except Exception as exc:
+            logger.debug(f"使用现有微信窗口句柄获取控件树失败: {exc}")
 
-        sent = ChatWindow.send_text_via_input(
-            edit,
-            content,
-            clipboard_error="写入回复到剪贴板失败",
-            send_error=f"发送群聊回复失败: {session.group}",
-            logger_override=logger,
+        try:
+            hwnd = platform.window_manager.find_wechat_window()
+            if hwnd:
+                self.client.window._hwnd = hwnd
+                return platform.automation.control_from_handle(hwnd)
+        except Exception as exc:
+            logger.debug(f"获取微信主窗口控件树失败: {exc}")
+            return None
+
+    def _recover_send_surface(
+        self,
+        session: _ListenSession,
+        *,
+        reason: str,
+        content: str = "",
+        attempt: int = 0,
+    ) -> bool:
+        """恢复发送表面：关闭弹窗/独立聊天窗口，重新激活主窗口。
+
+        Returns:
+            如果回复已经出现在独立窗口里，返回 True，避免重复发送。
+        """
+        logger.warning(
+            "发送恢复流程: group=%s, attempt=%s/%s, reason=%s",
+            session.group,
+            attempt or "-",
+            SEND_ATTEMPT_LIMIT,
+            reason,
         )
-        if platform.platform_name == "darwin" and _dismiss_send_failure_dialog(session.root):
-            logger.error(f"微信提示发送失败: {session.group}")
+        log_error_audit(
+            "send_recovery",
+            {
+                "group": session.group,
+                "reason": reason,
+                "attempt": attempt,
+            },
+        )
+
+        detached_root = _get_detached_group_root(session.group) if content else None
+        if detached_root:
+            logger.warning("恢复时保留目标群独立窗口，下一轮直接在独立窗口发送: %s", session.group)
+            session.root = detached_root
             self._current_send_group = None
-            log_error_audit(
-                "wechat_send_failure_dialog",
-                {"group": session.group, "reply": content},
-            )
+            self._current_send_surface_detached = True
+            self._stop_event.wait(RECOVERY_PAUSE_SECONDS)
             return False
-        if sent:
-            self._current_send_group = session.group
-        return sent
 
-    def _activate_group_for_send(self, session: _ListenSession) -> bool:
-        handles = []
-        for hwnd in (self.client.window.hwnd, platform.window_manager.find_wechat_window()):
-            if hwnd and hwnd not in handles:
-                handles.append(hwnd)
+        closed, _ = _close_detached_group_windows(session.group)
+        if closed:
+            self._current_send_group = None
 
-        last_reason = "no_window"
-        for hwnd in handles:
+        for root in (session.root, self._get_main_root()):
+            if not root:
+                continue
+            _dismiss_send_failure_dialog(root)
             try:
-                root = platform.automation.control_from_handle(hwnd)
-            except Exception as exc:
-                last_reason = f"root_failed:{exc}"
+                root.SendKeys("{Esc}")
+            except Exception:
+                pass
+            session.root = root
+
+        self._current_send_group = None
+        self._stop_event.wait(RECOVERY_PAUSE_SECONDS)
+        return False
+
+    def _send_in_subwindow(self, session: _ListenSession, content: str) -> bool:
+        last_reason = ""
+        for attempt in range(1, SEND_ATTEMPT_LIMIT + 1):
+            if self._stop_event.is_set():
+                return False
+            if attempt > 1:
+                recovered_visible = self._recover_send_surface(
+                    session,
+                    reason=last_reason or "retry",
+                    content=content,
+                    attempt=attempt,
+                )
+                if recovered_visible:
+                    self._current_send_group = session.group
+                    self._current_send_group_at = time.time()
+                    return True
+
+            if self._current_send_group != session.group:
+                self._current_send_group = None
+            self._current_send_surface_detached = False
+            if not self._activate_group_for_send(session):
+                last_reason = "activate_group_failed"
+                logger.warning(
+                    "发送尝试 %s/%s 切换目标群失败: %s",
+                    attempt,
+                    SEND_ATTEMPT_LIMIT,
+                    session.group,
+                )
                 continue
 
-            _dismiss_send_failure_dialog(root)
-            clicked_at = 0.0
-            for attempt in range(2):
-                try:
-                    root = platform.automation.control_from_handle(hwnd)
-                    item = _find_session_item(root, session.group)
-                    if not item:
-                        last_reason = "session_item_missing"
-                        break
-                    if clicked_at:
-                        time.sleep(max(0.0, 1.2 - (time.time() - clicked_at)))
-                    if not _click_session_item(item):
-                        last_reason = "session_item_click_failed"
-                        continue
-                    clicked_at = time.time()
-                    wait_deadline = time.time() + 3.5
-                    while time.time() < wait_deadline:
-                        time.sleep(0.25)
-                        session.root = platform.automation.control_from_handle(hwnd)
-                        msg_list = _find_message_list(session.root)
-                        edit = self._find_chat_input(session.root)
-                        if msg_list:
-                            session.msg_list = msg_list
-                        if msg_list and edit:
-                            self._current_send_group = session.group
-                            return True
-                        last_reason = f"msg_list={bool(msg_list)}, edit={bool(edit)}"
-                except Exception as exc:
-                    last_reason = f"attempt_failed:{exc}"
+            root = session.root
+            sent = self._send_text_direct(root, content)
+            if not sent:
+                edit = self._find_chat_input(root)
+                if not edit:
+                    last_reason = "chat_input_missing"
+                    logger.warning(
+                        "发送尝试 %s/%s 未找到聊天输入框: %s",
+                        attempt,
+                        SEND_ATTEMPT_LIMIT,
+                        session.group,
+                    )
                     continue
-        logger.error(f"发送前切换目标群失败: {session.group}, reason={last_reason}")
+
+                sent = ChatWindow.send_text_via_input(
+                    edit,
+                    content,
+                    clipboard_error="写入回复到剪贴板失败",
+                    send_error=f"发送群聊回复失败: {session.group}",
+                    logger_override=logger,
+                )
+            if _dismiss_send_failure_dialog(session.root):
+                logger.error(f"微信提示发送失败: {session.group}")
+                self._current_send_group = None
+                self._current_send_surface_detached = False
+                log_error_audit(
+                    "wechat_send_failure_dialog",
+                    {"group": session.group, "reply": content, "attempt": attempt},
+                )
+                last_reason = "wechat_send_failure_dialog"
+                continue
+            if sent and self._verify_reply_visible(session, content, timeout=SEND_VERIFY_TIMEOUT):
+                if self._current_send_surface_detached:
+                    _close_detached_group_windows(session.group, expected_message=content)
+                    self._current_send_surface_detached = False
+                self._current_send_group = session.group
+                self._current_send_group_at = time.time()
+                return True
+            if sent and self._last_verify_closed_detached and attempt < SEND_ATTEMPT_LIMIT:
+                logger.warning("检测到回复流程进入独立聊天窗口，下一轮改用独立窗口发送: %s", session.group)
+                log_error_audit(
+                    "detached_window_detected_retry",
+                    {"group": session.group, "reply": content, "attempt": attempt},
+                )
+                self._current_send_group = None
+                self._current_send_surface_detached = False
+                last_reason = "detached_window_detected_retry"
+                self._stop_event.wait(0.8)
+                continue
+            if sent:
+                last_reason = "reply_not_visible_after_send"
+                logger.warning(
+                    "发送尝试 %s/%s 后未确认到回复: %s -> %s",
+                    attempt,
+                    SEND_ATTEMPT_LIMIT,
+                    session.group,
+                    content[:80],
+                )
+                continue
+            last_reason = "send_text_failed"
+            logger.warning(
+                "发送尝试 %s/%s 写入或发送失败: %s",
+                attempt,
+                SEND_ATTEMPT_LIMIT,
+                session.group,
+            )
+
+        logger.error(
+            "群聊回复发送最终失败: %s, reason=%s, reply=%s",
+            session.group,
+            last_reason,
+            content[:120],
+        )
+        self._current_send_group = None
+        self._current_send_surface_detached = False
+        log_error_audit(
+            "reply_failed_after_retries",
+            {"group": session.group, "reply": content, "reason": last_reason},
+        )
+        return False
+
+    @staticmethod
+    def _send_text_direct(root, content: str) -> bool:
+        """不依赖输入框 AX 控件，直接点击窗口底部输入区并发送。"""
+        if not root or not content:
+            return False
+        try:
+            rect = root.BoundingRectangle
+            if not rect:
+                return False
+            x = int(rect.left + rect.width * 0.58)
+            y = int(rect.bottom - 58)
+            platform.input.mouse_click(x, y)
+            time.sleep(0.08)
+            platform.input.send_combo(platform.input.VK_CONTROL, platform.input.VK_A, settle_time=0.04)
+            platform.input.key_down(platform.input.VK_DELETE)
+            time.sleep(0.02)
+            platform.input.key_up(platform.input.VK_DELETE)
+            if not platform.clipboard.set_text(content):
+                logger.error("写入回复到剪贴板失败")
+                return False
+            platform.input.send_combo(platform.input.VK_CONTROL, platform.input.VK_V, settle_time=0.08)
+            platform.input.key_down(platform.input.VK_RETURN)
+            time.sleep(0.02)
+            platform.input.key_up(platform.input.VK_RETURN)
+            time.sleep(0.15)
+            return True
+        except Exception as exc:
+            logger.debug("直接坐标发送失败: %s", exc)
+            return False
+
+    def _verify_reply_visible(
+        self,
+        session: _ListenSession,
+        content: str,
+        timeout: float = 5.0,
+    ) -> bool:
+        """快速确认发送是否被明显阻断。
+
+        最短直达策略：发送动作成功后，不再扫描聊天消息列表等待 UI 回显；
+        只快速检查发送失败弹窗和目标群独立窗口。没有明显阻断就视为成功。
+        """
+        expected = _normalize_message_text(content)
+        if not expected:
+            return False
+
+        self._last_verify_closed_detached = False
+        deadline = time.time() + min(timeout, SEND_VERIFY_TIMEOUT)
+        while time.time() < deadline:
+            if _dismiss_send_failure_dialog(session.root):
+                log_error_audit(
+                    "wechat_send_failure_dialog",
+                    {"group": session.group, "reply": content},
+                )
+                return False
+            if not self._current_send_surface_detached:
+                detached_root = _get_detached_group_root(session.group)
+                if detached_root:
+                    session.root = detached_root
+                    self._last_verify_closed_detached = True
+                    logger.warning("发送后快速检测到目标群独立窗口，改用独立窗口重发: %s", session.group)
+                    return False
+            if self._stop_event.wait(0.15):
+                return False
+
+        return True
+
+    def _activate_group_for_send(self, session: _ListenSession) -> bool:
+        last_reason = "no_window"
+        for attempt in range(1, GROUP_SWITCH_ATTEMPT_LIMIT + 1):
+            if self._stop_event.is_set():
+                return False
+            if attempt > 1:
+                self._recover_send_surface(
+                    session,
+                    reason=last_reason,
+                    attempt=attempt,
+                )
+
+            if (
+                self._current_send_group == session.group
+                and time.time() - self._current_send_group_at <= 180
+            ):
+                root = session.root or self._get_main_root()
+                if root:
+                    session.root = root
+                    self._current_send_surface_detached = False
+                    logger.info("复用当前群窗口直接发送: group=%s", session.group)
+                    return True
+
+            detached_root = _get_detached_group_root(session.group)
+            if detached_root:
+                detached_msg_list = _find_message_list(detached_root)
+                detached_edit = self._find_chat_input(detached_root)
+                if detached_msg_list and detached_edit:
+                    session.root = detached_root
+                    session.msg_list = detached_msg_list
+                    self._current_send_group = session.group
+                    self._current_send_group_at = time.time()
+                    self._current_send_surface_detached = True
+                    logger.warning("使用目标群独立聊天窗口发送: %s", session.group)
+                    log_error_audit(
+                        "detached_window_used_for_send",
+                        {"group": session.group, "attempt": attempt},
+                    )
+                    return True
+
+            root = self._get_main_root()
+            if not root:
+                last_reason = "main_root_missing"
+                continue
+
+            session.root = root
+            _dismiss_send_failure_dialog(root)
+
+            try:
+                item = _find_session_item(root, session.group)
+                if not item:
+                    last_reason = "session_item_missing"
+                    logger.warning(
+                        "切群尝试 %s/%s 未找到左侧会话: %s",
+                        attempt,
+                        GROUP_SWITCH_ATTEMPT_LIMIT,
+                        session.group,
+                    )
+                    continue
+
+                selected_before = False
+                try:
+                    selected_before = bool(item.IsSelected)
+                except Exception:
+                    pass
+
+                if selected_before or self._current_send_group == session.group:
+                    self._current_send_group = session.group
+                    self._current_send_group_at = time.time()
+                    self._current_send_surface_detached = False
+                    return True
+
+                if not _click_session_item(item):
+                    last_reason = "session_item_click_failed"
+                    logger.warning(
+                        "切群尝试 %s/%s 点击会话失败: %s",
+                        attempt,
+                        GROUP_SWITCH_ATTEMPT_LIMIT,
+                        session.group,
+                    )
+                    continue
+
+                wait_deadline = time.time() + GROUP_SWITCH_WAIT_SECONDS
+                clicked_at = time.time()
+                detached_checked_after_click = False
+                while time.time() < wait_deadline:
+                    if self._stop_event.wait(0.12):
+                        return False
+                    now = time.time()
+                    if not detached_checked_after_click and now - clicked_at >= DETACHED_WINDOW_CHECK_INTERVAL:
+                        detached_checked_after_click = True
+                        detached_root = _get_detached_group_root(session.group)
+                        if detached_root:
+                            detached_msg_list = _find_message_list(detached_root)
+                            detached_edit = self._find_chat_input(detached_root)
+                            if detached_msg_list and detached_edit:
+                                session.root = detached_root
+                                session.msg_list = detached_msg_list
+                                self._current_send_group = session.group
+                                self._current_send_group_at = time.time()
+                                self._current_send_surface_detached = True
+                                logger.warning("会话点击打开了独立窗口，改用独立窗口发送: %s", session.group)
+                                log_error_audit(
+                                    "detached_window_used_for_send",
+                                    {"group": session.group, "attempt": attempt, "after_click": True},
+                                )
+                                return True
+
+                    if now - clicked_at >= GROUP_SWITCH_FALLBACK_ACCEPT_SECONDS:
+                        # 发送前不查输入框控件，避免 AX 查询卡住；发送动作会直接
+                        # 点击底部输入区并粘贴。
+                        session.root = root
+                        logger.info(
+                            "切群后直接发送: group=%s, attempt=%s",
+                            session.group,
+                            attempt,
+                        )
+                        self._current_send_group = session.group
+                        self._current_send_group_at = time.time()
+                        self._current_send_surface_detached = False
+                        return True
+            except Exception as exc:
+                last_reason = f"attempt_failed:{exc}"
+                logger.warning(
+                    "切群尝试 %s/%s 异常: %s: %s",
+                    attempt,
+                    GROUP_SWITCH_ATTEMPT_LIMIT,
+                    session.group,
+                    exc,
+                )
+                continue
+
+        logger.error(f"发送前切换目标群最终失败: {session.group}, reason={last_reason}")
         log_error_audit(
             "activate_group_failed",
             {"group": session.group, "reason": last_reason},
@@ -1234,7 +1423,7 @@ class WeChatGroupListener:
         for auto_id in possible_ids:
             try:
                 edit = root.EditControl(AutomationId=auto_id)
-                if edit.Exists(maxSearchSeconds=0.3):
+                if edit.Exists(maxSearchSeconds=QUICK_EXISTS_TIMEOUT):
                     return edit
             except Exception:
                 continue

@@ -22,9 +22,10 @@
 
 运行环境：
 
-- Windows 10 / 11
+- macOS 12+
 - Python 3.9+
 - 已安装并登录微信 4.x
+- 已给终端、Python 或 OpenClaw 授予 macOS 辅助功能权限
 
 安装：
 

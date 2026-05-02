@@ -180,7 +180,7 @@ class GroupManager(BasePage):
                 results.append({'hwnd': hwnd, 'title': title})
             return True
 
-        platform.window_manager.enum_windows(enum_callback, windows)
+        platform.window_manager.enum_window_handles(enum_callback, windows)
         return windows[0] if windows else None
 
     def _get_announcement_popup(self):

@@ -19,7 +19,7 @@ class WeChatClient:
     """
     wx4py 客户端
 
-    用于在 Windows 上自动化操作微信的主类。
+    用于在 macOS 上自动化操作微信的主类。
 
     用法:
         wx = WeChatClient()
@@ -56,9 +56,9 @@ class WeChatClient:
         连接微信窗口。
 
         流程：
-        1. 检查并修复注册表（RunningState）
+        1. 检查 macOS 辅助功能权限
         2. 查找并绑定微信窗口
-        3. 初始化 UIAutomation
+        3. 初始化 Accessibility 控件树
 
         Returns:
             bool: 连接成功返回 True
@@ -149,7 +149,7 @@ class WeChatClient:
 
     @property
     def outgoing_registry(self) -> OutgoingMessageRegistry:
-        """获取客户端级共享的已发送消息注册表。"""
+        """获取客户端级共享的已发送消息记录器。"""
         return self._outgoing_registry
 
     def __enter__(self):

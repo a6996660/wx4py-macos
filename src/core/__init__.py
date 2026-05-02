@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Windows 平台与 UIAutomation 底层能力。"""
+"""macOS 微信自动化核心能力。"""
 
 from .exceptions import (
     ControlNotFoundError,
-    RegistryError,
     TargetNotFoundError,
     UIAError,
     WeChatError,
@@ -22,5 +21,4 @@ __all__ = [
     "UIAError",
     "ControlNotFoundError",
     "TargetNotFoundError",
-    "RegistryError",
 ]

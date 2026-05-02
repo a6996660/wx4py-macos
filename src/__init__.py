@@ -2,7 +2,7 @@
 """
 wx4py - Python 微信自动化工具
 
-基于 UIAutomation 的微信自动化 Python 库，支持 Windows Qt 版本微信客户端。
+面向 macOS 微信 4.x 的自动化工具，重点支持群聊 @ AI 自动回复。
 """
 
 from ._version import __version__
@@ -30,7 +30,6 @@ from .core.exceptions import (
     WeChatNotConnectedError,
     ControlNotFoundError,
     TargetNotFoundError,
-    RegistryError,
 )
 
 __author__ = "wx4py Team"
@@ -58,5 +57,4 @@ __all__ = [
     "WeChatNotConnectedError",
     "ControlNotFoundError",
     "TargetNotFoundError",
-    "RegistryError",
 ]

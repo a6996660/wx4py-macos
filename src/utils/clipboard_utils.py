@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """剪贴板工具"""
 import os
-import struct
 
 
 def _get_platform():

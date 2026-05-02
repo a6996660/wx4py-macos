@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""平台抽象层基类接口定义。
+"""macOS 平台抽象接口。
 
-定义了 wx4py 跨平台所需的 6 个核心抽象接口。
-各平台后端（Windows/macOS）必须实现这些接口。
+这些接口保留了少量 UIAutomation 风格方法名，方便上层页面对象继续用
+``ButtonControl``/``EditControl``/``Exists`` 这样的调用方式访问 macOS AX 控件。
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 class _LazyControl:
     """延迟控件查找器，支持链式调用和 .Exists() 超时搜索。
 
-    模拟 Windows uiautomation 的 lazy finder 行为。
     在首次属性访问或调用 .Exists() 时才执行实际查找。
 
     构造时仅记录搜索条件，不执行查找。调用 .Exists() 或访问任何
@@ -43,7 +42,7 @@ class _LazyControl:
 
     @staticmethod
     def _normalize_search_kwargs(search_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """兼容 Windows UIAutomation 的 PascalCase 查找参数。"""
+        """兼容历史调用里的 PascalCase 查找参数。"""
         key_map = {
             "Name": "name",
             "ClassName": "class_name",
@@ -222,10 +221,7 @@ class _LazyControl:
 
 
 class PlatformControl:
-    """平台无关的 UI 控件抽象表示。
-
-    桥接 Windows UIAutomation Control 和 macOS AXUIElement。
-    """
+    """macOS AXUIElement 的轻量包装。"""
 
     def __init__(self, backend: "AutomationEngine", native: Any):
         self._backend = backend
@@ -288,8 +284,7 @@ class PlatformControl:
         return self._backend.exists(self, maxSearchSeconds)
 
     # --- UIA 风格的控件查找工厂方法 ---
-    # 这些方法模拟 Windows uiautomation 的 finder API，
-    # 内部委托给平台后端的 find_control()。
+    # 内部委托给 macOS 后端的 find_control()。
 
     def _find_child(self, control_type: str, **kwargs) -> "PlatformControl":
         """通用子控件查找，返回 PlatformControl 或包装的 'Control' 对象。
@@ -376,47 +371,11 @@ class BoundingRect:
 
 
 # ============================================================================
-# 平台内部状态数据结构
-# ============================================================================
-
-class TrayButtonData:
-    """托盘按钮解析数据（Windows 专用；macOS 后端可为空）。"""
-    __slots__ = (
-        "toolbar_hwnd", "index", "id_command", "dw_data",
-        "hwnd", "uid", "callback_msg", "exe_path", "title", "class_name",
-    )
-
-    def __init__(
-        self,
-        toolbar_hwnd: int = 0,
-        index: int = 0,
-        id_command: int = 0,
-        dw_data: int = 0,
-        hwnd: int = 0,
-        uid: int = 0,
-        callback_msg: int = 0,
-        exe_path: str = "",
-        title: str = "",
-        class_name: str = "",
-    ):
-        self.toolbar_hwnd = toolbar_hwnd
-        self.index = index
-        self.id_command = id_command
-        self.dw_data = dw_data
-        self.hwnd = hwnd
-        self.uid = uid
-        self.callback_msg = callback_msg
-        self.exe_path = exe_path
-        self.title = title
-        self.class_name = class_name
-
-
-# ============================================================================
-# UIA Pattern 常量（从 uiautomation 提取，使 groups.py 等不依赖 uiautomation）
+# UIA Pattern 常量（保留历史数值，供 groups.py 的 Toggle/Value 封装使用）
 # ============================================================================
 
 class ToggleState:
-    """模拟 Windows UIA ToggleState 枚举。"""
+    """Toggle 状态枚举。"""
     Off = 0
     On = 1
     Indeterminate = 2
@@ -476,7 +435,7 @@ class WindowManager(ABC):
         """查找微信主窗口句柄/ID。
 
         Returns:
-            窗口句柄（Windows HWND 或 macOS window ID），未找到返回 None。
+            macOS 窗口 ID，未找到返回 None。
         """
         ...
 
@@ -499,7 +458,7 @@ class WindowManager(ABC):
 
     @abstractmethod
     def get_class(self, hwnd: int) -> str:
-        """获取窗口类名（Windows）或进程名（macOS）。"""
+        """获取窗口角色或进程名。"""
         ...
 
     @abstractmethod
@@ -513,7 +472,7 @@ class WindowManager(ABC):
         ...
 
     @abstractmethod
-    def enum_windows(self, callback: Callable, extra: Any = None) -> None:
+    def enum_window_handles(self, callback: Callable, extra: Any = None) -> None:
         """枚举所有顶层窗口。
 
         Args:
@@ -523,7 +482,7 @@ class WindowManager(ABC):
         ...
 
     @abstractmethod
-    def enum_child_windows(self, parent: int) -> List[int]:
+    def enum_child_window_handles(self, parent: int) -> List[int]:
         """枚举指定窗口的所有子窗口。
 
         Returns:
@@ -745,7 +704,7 @@ class InputSimulator(ABC):
         ...
 
     # --- 通用虚拟键码常量 ---
-    # 子类可覆盖，但默认提供 Windows 兼容值
+    # 这些常量是上层跨模块约定，macOS 后端会映射为 CGEvent 键码。
     VK_CONTROL = 0x11
     VK_RETURN = 0x0D
     VK_TAB = 0x09
@@ -829,11 +788,7 @@ class ProcessManager(ABC):
 
 
 class SystemAccessibility(ABC):
-    """系统辅助功能配置抽象接口。
-
-    Windows 侧：注册表 RunningState + SPI_SETSCREENREADER
-    macOS 侧：辅助功能权限检查
-    """
+    """macOS 辅助功能权限抽象接口。"""
 
     @abstractmethod
     def check_accessibility_permission(self) -> bool:
@@ -857,7 +812,7 @@ class SystemAccessibility(ABC):
 
     @abstractmethod
     def restore_from_tray(self, hwnd: int) -> bool:
-        """通过系统托盘/菜单栏恢复微信窗口。
+        """通过 Dock/AppleScript 恢复微信窗口。
 
         Args:
             hwnd: 当前微信窗口句柄（可能不可见）
@@ -912,5 +867,5 @@ class PlatformBackend(ABC):
     @property
     @abstractmethod
     def platform_name(self) -> str:
-        """平台名称：'windows' 或 'darwin'。"""
+        """平台名称：'darwin'。"""
         ...

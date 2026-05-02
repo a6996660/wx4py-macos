@@ -685,8 +685,7 @@ class ChatWindow(BasePage):
             auto_id = item.AutomationId or ""
 
             # macOS Accessibility often exposes search/session rows as generic
-            # AXStaticText with an AXIdentifier such as session_item_<name>,
-            # not as Windows Qt SearchContentCellView controls.
+            # AXStaticText with an AXIdentifier such as session_item_<name>.
             if auto_id.startswith(('session_item_', 'search_item_')) and name:
                 group = current_group or GROUP_CONTACTS
                 result = SearchResult(

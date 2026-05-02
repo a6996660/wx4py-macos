@@ -30,8 +30,3 @@ class ControlNotFoundError(UIAError):
 class TargetNotFoundError(ControlNotFoundError):
     """目标聊天在搜索结果中未找到"""
     pass
-
-
-class RegistryError(WeChatError):
-    """注册表操作错误"""
-    pass

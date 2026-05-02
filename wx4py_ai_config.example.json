@@ -29,8 +29,8 @@
       "model": "bot-20241125225426-wzcrl",
       "api_key": "replace-with-your-ark-api-key",
       "temperature": 0.7,
-      "max_tokens": 300,
-      "timeout": 60
+      "max_tokens": 220,
+      "timeout": 20
     }
   }
 }
