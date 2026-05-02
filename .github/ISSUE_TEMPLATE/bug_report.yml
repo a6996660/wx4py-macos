@@ -1,0 +1,109 @@
+name: Bug 反馈
+description: 提交使用中遇到的问题，请尽量提供完整复现信息
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈问题。为了更快定位，请尽量完整填写下面的信息。
+        特别需要：
+        - 微信版本号
+        - wx4py 版本号
+        - 详细复现步骤
+        - 相关截图或日志
+
+  - type: input
+    id: wechat_version
+    attributes:
+      label: 微信版本号
+      description: 例如 `4.1.8.29`
+      placeholder: 请输入你当前使用的微信版本号
+    validations:
+      required: true
+
+  - type: input
+    id: wx4py_version
+    attributes:
+      label: wx4py 版本号
+      description: 例如 `1.0.4`
+      placeholder: 请输入你当前使用的 wx4py 版本号
+    validations:
+      required: true
+
+  - type: input
+    id: python_version
+    attributes:
+      label: Python 版本号
+      description: 例如 `3.11.9`
+      placeholder: 请输入 Python 版本号
+    validations:
+      required: true
+
+  - type: input
+    id: os_version
+    attributes:
+      label: Windows 版本
+      description: 例如 `Windows 11 24H2`
+      placeholder: 请输入你的 Windows 版本
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce_steps
+    attributes:
+      label: 详细复现步骤
+      description: 请按顺序描述从启动到报错的完整过程，越详细越好
+      placeholder: |
+        1. 打开微信并登录
+        2. 执行 xxx 脚本
+        3. 调用 xxx 方法
+        4. 在搜索目标时出现错误
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: 预期行为
+      placeholder: 例如：应该成功打开群聊并发送消息
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual_behavior
+    attributes:
+      label: 实际行为
+      placeholder: 例如：搜索框未找到，或窗口重连后依然失败
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志或报错信息
+      description: 请粘贴完整报错、控制台输出或相关日志，注意脱敏
+      render: shell
+      placeholder: |
+        Traceback (most recent call last):
+        ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: 截图或录屏
+      description: 强烈建议附带微信界面截图、错误弹窗截图或复现录屏链接
+      placeholder: 请将截图拖拽到这里，或粘贴图片/录屏链接
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: 其他补充信息
+      description: 例如是否首次运行、是否刚升级微信、是否在批量发送时触发等
+    validations:
+      required: false

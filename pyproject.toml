@@ -1,0 +1,61 @@
+[project]
+name = "wx4py"
+dynamic = ["version"]
+description = "wx4py - Python 微信自动化工具"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "AGPL-3.0-or-later"}
+authors = [
+    {name = "claw-codes"}
+]
+keywords = ["wx4py", "wechat", "automation", "uiautomation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "pywin32>=305; sys_platform == 'win32'",
+    "comtypes>=1.2.0; sys_platform == 'win32'",
+    "pyobjc-framework-Quartz>=8.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=8.0; sys_platform == 'darwin'",
+    "pyperclip",
+    "markdown",
+    "beautifulsoup4",
+    "Pillow",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/claw-codes/wx4py"
+Repository = "https://github.com/claw-codes/wx4py"
+Documentation = "https://github.com/claw-codes/wx4py/blob/main/README.md"
+Issues = "https://github.com/claw-codes/wx4py/issues"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"wx4py" = "src"}
+
+[tool.setuptools.dynamic]
+version = {attr = "src._version.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
