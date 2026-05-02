@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -25,6 +27,47 @@ from src import AIClient, AIConfig, AIResponder, AsyncCallbackHandler, WeChatCli
 
 
 DEFAULT_CONFIG_FILE = "wx4py_ai_config.json"
+DEFAULT_LOCK_FILE = ".wx4py_ai_group_bot.lock"
+
+
+@contextmanager
+def _single_instance_lock(lock_path: Path):
+    """进程级单实例锁，防止多个机器人同时回复同一批消息。"""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("w", encoding="utf-8")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise RuntimeError("检测到已有机器人进程在运行，请先停止旧进程。") from exc
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise RuntimeError("检测到已有机器人进程在运行，请先停止旧进程。") from exc
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
 
 
 def _config_path() -> Path:
@@ -84,40 +127,51 @@ def _configure_group_log_root(config: Dict[str, Any]) -> str:
     return value
 
 
+def _lock_path(config_file: Path) -> Path:
+    """锁文件放在配置文件同目录，便于多项目并行时相互隔离。"""
+    return config_file.parent / DEFAULT_LOCK_FILE
+
+
 def main() -> None:
     config_file = _config_path()
-    raw_config = _load_raw_config(config_file)
-    groups = _load_groups(raw_config)
-    reply_delay_range = _load_reply_delay_range(raw_config)
-    ai_queue_size = _load_ai_queue_size(raw_config)
-    ai_context_size = _load_ai_context_size(raw_config)
-    group_log_root = _configure_group_log_root(raw_config)
+    try:
+        with _single_instance_lock(_lock_path(config_file)):
+            raw_config = _load_raw_config(config_file)
+            groups = _load_groups(raw_config)
+            reply_delay_range = _load_reply_delay_range(raw_config)
+            ai_queue_size = _load_ai_queue_size(raw_config)
+            ai_context_size = _load_ai_context_size(raw_config)
+            group_log_root = _configure_group_log_root(raw_config)
 
-    # AIConfig.from_file 会读取 providers/default，并支持环境变量覆盖。
-    ai = AIClient(AIConfig.from_file(str(config_file)))
+            # AIConfig.from_file 会读取 providers/default，并支持环境变量覆盖。
+            ai = AIClient(AIConfig.from_file(str(config_file)))
 
-    print(f"配置文件: {config_file}")
-    print(f"监听群聊: {', '.join(groups)}")
-    print(f"回复随机延迟: {reply_delay_range[0]:.1f} - {reply_delay_range[1]:.1f} 秒")
-    print(f"大模型消息队列: {'不限制' if ai_queue_size == 0 else ai_queue_size}")
-    print(f"同群上下文长度: {ai_context_size}")
-    print(f"群聊审计日志: {group_log_root}")
-    print("启动中：只有被 @ 时才会调用大模型回复。按 Ctrl+C 停止。")
+            print(f"配置文件: {config_file}")
+            print(f"监听群聊: {', '.join(groups)}")
+            print(f"回复随机延迟: {reply_delay_range[0]:.1f} - {reply_delay_range[1]:.1f} 秒")
+            print(f"大模型消息队列: {'不限制' if ai_queue_size == 0 else ai_queue_size}")
+            print(f"同群上下文长度: {ai_context_size}")
+            print(f"群聊审计日志: {group_log_root}")
+            print(f"单实例锁: {_lock_path(config_file)}")
+            print("启动中：只有被 @ 时才会调用大模型回复。按 Ctrl+C 停止。")
 
-    with WeChatClient(auto_connect=True) as wx:
-        wx.process_groups(
-            groups,
-            [
-                AsyncCallbackHandler(
-                    AIResponder(ai, context_size=ai_context_size, reply_on_at=True),
-                    auto_reply=True,
-                    reply_on_at=True,
-                    queue_size=ai_queue_size,
+            with WeChatClient(auto_connect=True) as wx:
+                wx.process_groups(
+                    groups,
+                    [
+                        AsyncCallbackHandler(
+                            AIResponder(ai, context_size=ai_context_size, reply_on_at=True),
+                            auto_reply=True,
+                            reply_on_at=True,
+                            queue_size=ai_queue_size,
+                        )
+                    ],
+                    reply_delay_range=reply_delay_range,
+                    block=True,
                 )
-            ],
-            reply_delay_range=reply_delay_range,
-            block=True,
-        )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":
