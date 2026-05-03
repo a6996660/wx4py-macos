@@ -43,6 +43,7 @@ RECOVERY_PAUSE_SECONDS = 0.25
 GROUP_SWITCH_FALLBACK_ACCEPT_SECONDS = 0.5
 DETACHED_WINDOW_CHECK_INTERVAL = 0.25
 QUICK_EXISTS_TIMEOUT = 0.08
+_SESSION_ITEM_CACHE_TTL = 60.0
 
 _CURRENT_ACCOUNT_NICKNAME: Optional[str] = None
 _CURRENT_ACCOUNT_NICKNAME_LOCK = threading.Lock()
@@ -76,6 +77,10 @@ class _VisibleItem:
         return self.runtime_id, self.class_name, self.name
 
 
+class _UNSET:
+    pass
+
+
 @dataclass
 class _ListenSession:
     group: str
@@ -93,6 +98,8 @@ class _ListenSession:
     next_scan_at: float = field(default_factory=time.time)
     interval: float = 0.3
     suppress_next_scan: bool = True
+    cached_session_item: Optional[object] = None
+    cached_session_item_at: float = 0.0
 
 
 @dataclass
@@ -802,6 +809,8 @@ class WeChatGroupListener:
         self._current_send_group_at = 0.0
         self._current_send_surface_detached = False
         self._last_verify_closed_detached = False
+        self._send_in_progress = False
+        self._send_state_lock = threading.Lock()
 
     @property
     def is_running(self) -> bool:
@@ -973,6 +982,12 @@ class WeChatGroupListener:
         注意：这会临时切换当前聊天窗口到目标群聊。
         """
         try:
+            # 如果当前有发送正在进行，跳过点击切群，避免覆盖发送状态
+            _, _, _, in_progress = self._get_send_state()
+            if in_progress:
+                logger.debug("获取引用: 发送进行中，跳过点击切群 group=%s", session.group)
+                return None, None
+
             # 获取左侧会话项并点击打开群聊
             root = platform.automation.control_from_handle(self.client.window.hwnd)
             session_item = _find_session_item(root, session.group)
@@ -988,8 +1003,7 @@ class WeChatGroupListener:
                 _click_session_item(session_item)
                 time.sleep(0.3)
                 # 更新发送状态，避免后续发送流程重复切群导致 AX 竞争
-                self._current_send_group = session.group
-                self._current_send_group_at = time.time()
+                self._set_send_state(group=session.group, group_at=time.time())
                 try:
                     session.root = platform.automation.control_from_handle(self.client.window.hwnd)
                 except Exception:
@@ -1306,6 +1320,44 @@ class WeChatGroupListener:
             finally:
                 self._reply_queue.task_done()
 
+    def _get_send_state(self):
+        """原子读取当前发送状态快照。"""
+        with self._send_state_lock:
+            return (
+                self._current_send_group,
+                self._current_send_group_at,
+                self._current_send_surface_detached,
+                self._send_in_progress,
+            )
+
+    def _set_send_state(
+        self,
+        group=_UNSET,
+        group_at=_UNSET,
+        detached=_UNSET,
+        in_progress=_UNSET,
+    ):
+        """原子更新发送状态。"""
+        with self._send_state_lock:
+            if group is not _UNSET:
+                self._current_send_group = group
+            if group_at is not _UNSET:
+                self._current_send_group_at = group_at
+            if detached is not _UNSET:
+                self._current_send_surface_detached = detached
+            if in_progress is not _UNSET:
+                self._send_in_progress = in_progress
+
+    @staticmethod
+    def _validate_control_cache(control) -> bool:
+        """检查缓存的控件引用是否仍然有效。"""
+        if control is None:
+            return False
+        try:
+            return bool(control.Exists(maxSearchSeconds=0.02))
+        except Exception:
+            return False
+
     def _get_main_root(self):
         """激活并获取微信主窗口控件根节点。"""
         try:
@@ -1360,14 +1412,13 @@ class WeChatGroupListener:
         if detached_root:
             logger.warning("恢复时保留目标群独立窗口，下一轮直接在独立窗口发送: %s", session.group)
             session.root = detached_root
-            self._current_send_group = None
-            self._current_send_surface_detached = True
+            self._set_send_state(group=None, detached=True)
             self._stop_event.wait(RECOVERY_PAUSE_SECONDS)
             return False
 
         closed, _ = _close_detached_group_windows(session.group)
         if closed:
-            self._current_send_group = None
+            self._set_send_state(group=None)
 
         for root in (session.root, self._get_main_root()):
             if not root:
@@ -1379,7 +1430,7 @@ class WeChatGroupListener:
                 pass
             session.root = root
 
-        self._current_send_group = None
+        self._set_send_state(group=None)
         self._stop_event.wait(RECOVERY_PAUSE_SECONDS)
         return False
 
@@ -1396,14 +1447,17 @@ class WeChatGroupListener:
                     attempt=attempt,
                 )
                 if recovered_visible:
-                    self._current_send_group = session.group
-                    self._current_send_group_at = time.time()
+                    self._set_send_state(group=session.group, group_at=time.time())
                     return True
 
-            if self._current_send_group != session.group:
-                self._current_send_group = None
-            self._current_send_surface_detached = False
+            current_group, _, current_detached, _ = self._get_send_state()
+            if current_group != session.group:
+                self._set_send_state(group=None)
+            self._set_send_state(detached=False)
+            # 标记发送进行中，防止监视线程的 _fetch_quote_from_chat 覆盖发送状态
+            self._set_send_state(in_progress=True)
             if not self._activate_group_for_send(session):
+                self._set_send_state(in_progress=False)
                 last_reason = "activate_group_failed"
                 logger.warning(
                     "发送尝试 %s/%s 切换目标群失败: %s",
@@ -1418,6 +1472,7 @@ class WeChatGroupListener:
             if not sent:
                 edit = self._find_chat_input(root)
                 if not edit:
+                    self._set_send_state(in_progress=False)
                     last_reason = "chat_input_missing"
                     logger.warning(
                         "发送尝试 %s/%s 未找到聊天输入框: %s",
@@ -1436,8 +1491,7 @@ class WeChatGroupListener:
                 )
             if _dismiss_send_failure_dialog(session.root):
                 logger.error(f"微信提示发送失败: {session.group}")
-                self._current_send_group = None
-                self._current_send_surface_detached = False
+                self._set_send_state(group=None, detached=False, in_progress=False)
                 log_error_audit(
                     "wechat_send_failure_dialog",
                     {"group": session.group, "reply": content, "attempt": attempt},
@@ -1445,11 +1499,13 @@ class WeChatGroupListener:
                 last_reason = "wechat_send_failure_dialog"
                 continue
             if sent and self._verify_reply_visible(session, content, timeout=SEND_VERIFY_TIMEOUT):
-                if self._current_send_surface_detached:
+                _, _, verify_detached, _ = self._get_send_state()
+                if verify_detached:
                     _close_detached_group_windows(session.group, expected_message=content)
-                    self._current_send_surface_detached = False
-                self._current_send_group = session.group
-                self._current_send_group_at = time.time()
+                    self._set_send_state(detached=False)
+                    session.root = None
+                    self._stop_event.wait(0.3)
+                self._set_send_state(group=session.group, group_at=time.time(), in_progress=False)
                 return True
             if sent and self._last_verify_closed_detached and attempt < SEND_ATTEMPT_LIMIT:
                 logger.warning("检测到回复流程进入独立聊天窗口，下一轮改用独立窗口发送: %s", session.group)
@@ -1457,8 +1513,7 @@ class WeChatGroupListener:
                     "detached_window_detected_retry",
                     {"group": session.group, "reply": content, "attempt": attempt},
                 )
-                self._current_send_group = None
-                self._current_send_surface_detached = False
+                self._set_send_state(group=None, detached=False, in_progress=False)
                 last_reason = "detached_window_detected_retry"
                 self._stop_event.wait(0.8)
                 continue
@@ -1486,8 +1541,7 @@ class WeChatGroupListener:
             last_reason,
             content[:120],
         )
-        self._current_send_group = None
-        self._current_send_surface_detached = False
+        self._set_send_state(group=None, detached=False, in_progress=False)
         log_error_audit(
             "reply_failed_after_retries",
             {"group": session.group, "reply": content, "reason": last_reason},
@@ -1548,7 +1602,8 @@ class WeChatGroupListener:
                     {"group": session.group, "reply": content},
                 )
                 return False
-            if not self._current_send_surface_detached:
+            _, _, current_detached, _ = self._get_send_state()
+            if not current_detached:
                 detached_root = _get_detached_group_root(session.group)
                 if detached_root:
                     session.root = detached_root
@@ -1572,14 +1627,16 @@ class WeChatGroupListener:
                     attempt=attempt,
                 )
 
+            # 原子读取当前发送状态快照
+            current_group, current_group_at, _, _ = self._get_send_state()
             if (
-                self._current_send_group == session.group
-                and time.time() - self._current_send_group_at <= 180
+                current_group == session.group
+                and time.time() - current_group_at <= 180
             ):
                 root = session.root or self._get_main_root()
                 if root:
                     session.root = root
-                    self._current_send_surface_detached = False
+                    self._set_send_state(detached=False)
                     logger.info("复用当前群窗口直接发送: group=%s", session.group)
                     return True
 
@@ -1590,9 +1647,9 @@ class WeChatGroupListener:
                 if detached_msg_list and detached_edit:
                     session.root = detached_root
                     session.msg_list = detached_msg_list
-                    self._current_send_group = session.group
-                    self._current_send_group_at = time.time()
-                    self._current_send_surface_detached = True
+                    self._set_send_state(
+                        group=session.group, group_at=time.time(), detached=True
+                    )
                     logger.warning("使用目标群独立聊天窗口发送: %s", session.group)
                     log_error_audit(
                         "detached_window_used_for_send",
@@ -1609,7 +1666,19 @@ class WeChatGroupListener:
             _dismiss_send_failure_dialog(root)
 
             try:
-                item = _find_session_item(root, session.group)
+                # 优先使用缓存的会话项引用
+                item = None
+                if (
+                    session.cached_session_item
+                    and time.time() - session.cached_session_item_at <= _SESSION_ITEM_CACHE_TTL
+                ):
+                    if self._validate_control_cache(session.cached_session_item):
+                        item = session.cached_session_item
+                if not item:
+                    item = _find_session_item(root, session.group)
+                    if item:
+                        session.cached_session_item = item
+                        session.cached_session_item_at = time.time()
                 if not item:
                     last_reason = "session_item_missing"
                     logger.warning(
@@ -1626,10 +1695,12 @@ class WeChatGroupListener:
                 except Exception:
                     pass
 
-                if selected_before or self._current_send_group == session.group:
-                    self._current_send_group = session.group
-                    self._current_send_group_at = time.time()
-                    self._current_send_surface_detached = False
+                # 重新读取状态，检查是否已被选中
+                current_group_check, _, _, _ = self._get_send_state()
+                if selected_before or current_group_check == session.group:
+                    self._set_send_state(
+                        group=session.group, group_at=time.time(), detached=False
+                    )
                     return True
 
                 if not _click_session_item(item):
@@ -1658,9 +1729,9 @@ class WeChatGroupListener:
                             if detached_msg_list and detached_edit:
                                 session.root = detached_root
                                 session.msg_list = detached_msg_list
-                                self._current_send_group = session.group
-                                self._current_send_group_at = time.time()
-                                self._current_send_surface_detached = True
+                                self._set_send_state(
+                                    group=session.group, group_at=time.time(), detached=True
+                                )
                                 logger.warning("会话点击打开了独立窗口，改用独立窗口发送: %s", session.group)
                                 log_error_audit(
                                     "detached_window_used_for_send",
@@ -1677,9 +1748,9 @@ class WeChatGroupListener:
                             session.group,
                             attempt,
                         )
-                        self._current_send_group = session.group
-                        self._current_send_group_at = time.time()
-                        self._current_send_surface_detached = False
+                        self._set_send_state(
+                            group=session.group, group_at=time.time(), detached=False
+                        )
                         return True
             except Exception as exc:
                 last_reason = f"attempt_failed:{exc}"
