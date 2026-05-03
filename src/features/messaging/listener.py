@@ -835,9 +835,15 @@ class WeChatGroupListener:
         """停止监听。"""
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5)
+            try:
+                self._thread.join(timeout=5)
+            except KeyboardInterrupt:
+                pass
         if self._sender_thread and self._sender_thread.is_alive():
-            self._sender_thread.join(timeout=5)
+            try:
+                self._sender_thread.join(timeout=5)
+            except KeyboardInterrupt:
+                pass
 
     def run_forever(self) -> None:
         """阻塞当前线程持续监听，直到 Ctrl+C。"""

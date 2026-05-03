@@ -382,7 +382,10 @@ class WeChatGroupProcessor:
         for handler in self.handlers:
             handler.stop()
         if self._sender_thread and self._sender_thread.is_alive():
-            self._sender_thread.join(timeout=5)
+            try:
+                self._sender_thread.join(timeout=5)
+            except KeyboardInterrupt:
+                pass
 
     def _needs_group_nickname(self) -> bool:
         return any(getattr(handler, "requires_group_nickname", False) for handler in self.handlers)
