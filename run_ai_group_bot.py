@@ -179,7 +179,11 @@ def _lock_path(config_file: Path) -> Path:
 
 def main() -> None:
     config_file = _config_path()
+
     try:
+        # 启动本地配置界面，用户通过浏览器完成配置后返回继续
+        from src.web_config import run_config_server
+        run_config_server(config_file)
         with _single_instance_lock(_lock_path(config_file)):
             with _prevent_system_sleep() as sleep_prevented:
                 raw_config = _load_raw_config(config_file)

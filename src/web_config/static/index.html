@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>wx4py AI 群聊机器人配置</title>
+<style>
+:root{--primary:#4f46e5;--primary-light:#eef2ff;--danger:#ef4444;--bg:#f3f4f6;--card:#fff;--text:#111827;--text-secondary:#6b7280;--border:#d1d5db;--radius:10px;--shadow:0 1px 3px rgba(0,0,0,0.08);}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.5;min-height:100vh;padding:24px 16px}
+.container{max-width:860px;margin:0 auto}
+header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:24px;flex-wrap:wrap}
+header h1{font-size:1.6rem;font-weight:700;color:var(--primary)}
+header p{color:var(--text-secondary);font-size:.9rem;margin-top:4px}
+header .actions{display:flex;gap:8px}
+.card{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:22px;margin-bottom:16px}
+.tabs{display:flex;gap:4px;border-bottom:1px solid #e5e7eb;margin-bottom:20px}
+.tab-btn{padding:10px 18px;border:none;background:none;color:var(--text-secondary);font-size:.9rem;font-weight:500;cursor:pointer;border-bottom:2px solid transparent;transition:.15s}
+.tab-btn:hover{color:var(--primary)}
+.tab-btn.active{color:var(--primary);border-bottom-color:var(--primary)}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
+.form-group{margin-bottom:18px}
+label{display:block;font-size:.85rem;font-weight:600;color:var(--text);margin-bottom:6px}
+.hint{font-size:.75rem;color:var(--text-secondary);margin-top:4px}
+input,select,textarea{width:100%;padding:9px 12px;border:1px solid var(--border);border-radius:8px;font-size:.9rem;background:#fff;transition:.15s}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(79,68,229,.1)}
+input.error,select.error{border-color:var(--danger)}
+.error-text{color:var(--danger);font-size:.75rem;margin-top:4px;display:none}
+input.error+.error-text,.form-group:has(input.error) .error-text{display:block}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.tag-input{display:flex;flex-wrap:wrap;gap:6px;padding:6px;border:1px solid var(--border);border-radius:8px;background:#fff;align-items:center}
+.tag-input:focus-within{border-color:var(--primary);box-shadow:0 0 0 3px rgba(79,68,229,.1)}
+.tag-input input{flex:1;min-width:120px;border:none;padding:4px 6px;font-size:.9rem;background:transparent}
+.tag-input input:focus{box-shadow:none}
+.tag{background:var(--primary-light);color:var(--primary);padding:3px 10px;border-radius:6px;font-size:.8rem;display:inline-flex;align-items:center;gap:4px}
+.tag button{border:none;background:none;color:var(--primary);cursor:pointer;font-size:1rem;line-height:1;padding:0 2px}
+.checkbox{display:flex;align-items:center;gap:8px;cursor:pointer}
+.checkbox input{width:auto}
+.provider-card{border:1px solid #e5e7eb;border-radius:8px;margin-bottom:12px;overflow:hidden}
+.provider-header{display:flex;align-items:center;gap:8px;padding:10px 14px;background:#f9fafb;cursor:pointer}
+.provider-header input{flex:1;border:none;background:transparent;padding:4px;font-weight:600;font-size:.9rem}
+.provider-header input:focus{box-shadow:none}
+.provider-header .toggle{margin-left:auto;font-size:.8rem;color:var(--text-secondary);transition:.2s}
+.provider-header.open .toggle{transform:rotate(180deg)}
+.provider-body{padding:14px;display:none;background:#fff}
+.provider-body.open{display:block}
+.provider-actions{display:flex;justify-content:flex-end;padding:8px 14px;background:#f9fafb;border-top:1px solid #e5e7eb}
+.btn{padding:9px 18px;border-radius:8px;border:none;font-size:.85rem;font-weight:600;cursor:pointer;transition:.15s;display:inline-flex;align-items:center;gap:6px}
+.btn-primary{background:var(--primary);color:#fff}
+.btn-primary:hover{background:#4338ca}
+.btn-primary:disabled{opacity:.6;cursor:not-allowed}
+.btn-secondary{background:#e5e7eb;color:#374151}
+.btn-secondary:hover{background:#d1d5db}
+.btn-danger{background:#fee2e2;color:#991b1b}
+.btn-danger:hover{background:#fecaca}
+.btn-sm{padding:6px 12px;font-size:.8rem}
+.footer-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:20px;position:sticky;bottom:16px;background:var(--card);padding:14px 20px;border-radius:var(--radius);box-shadow:0 4px 12px rgba(0,0,0,.1)}
+.modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:100;align-items:center;justify-content:center;padding:20px}
+.modal.show{display:flex}
+.modal-content{background:var(--card);border-radius:var(--radius);max-width:700px;width:100%;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 20px 40px rgba(0,0,0,.2)}
+.modal-header{padding:16px 20px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;align-items:center}
+.modal-body{padding:16px 20px;overflow:auto;flex:1}
+.modal-body pre{background:#1e293b;color:#e2e8f0;padding:14px;border-radius:8px;font-size:.8rem;overflow:auto;white-space:pre-wrap;word-break:break-all}
+.modal-footer{padding:14px 20px;border-top:1px solid #e5e7eb;display:flex;justify-content:flex-end;gap:8px}
+.section-title{font-size:1.05rem;font-weight:700;margin-bottom:14px;color:var(--text);display:flex;align-items:center;gap:8px}
+.section-title::before{content:"";display:block;width:4px;height:18px;background:var(--primary);border-radius:2px}
+.spinner{width:14px;height:14px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.toast{position:fixed;top:20px;right:20px;padding:12px 18px;border-radius:8px;color:#fff;font-size:.85rem;z-index:200;box-shadow:0 4px 12px rgba(0,0,0,.15);transform:translateX(120%);transition:.3s}
+.pwd-wrap{display:flex;gap:8px;align-items:center}
+.pwd-wrap input{flex:1}
+.eye-btn{background:none;border:none;cursor:pointer;padding:8px;font-size:1rem;color:var(--text-secondary);line-height:1;transition:.15s}
+.eye-btn:hover{color:var(--primary)}
+.eye-btn.active{color:var(--primary)}
+.toast.show{transform:translateX(0)}
+.toast.success{background:#10b981}
+.toast.error{background:var(--danger)}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div>
+      <h1>wx4py AI 群聊机器人</h1>
+      <p>通过浏览器完成配置，无需手动编辑 JSON 文件</p>
+    </div>
+    <div class="actions">
+      <button class="btn btn-secondary btn-sm" onclick="previewConfig()">预览 JSON</button>
+      <button class="btn btn-secondary btn-sm" onclick="resetConfig()">重置</button>
+    </div>
+  </header>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="basic">基础设置</button>
+    <button class="tab-btn" data-tab="ai">AI 模型</button>
+    <button class="tab-btn" data-tab="openclaw">OpenClaw</button>
+  </div>
+
+  <form id="configForm" onsubmit="return false">
+    <div class="tab-panel active" data-tab="basic">
+      <div class="card">
+        <div class="section-title">监听与回复</div>
+        <div class="form-group">
+          <label>监听群聊</label>
+          <div class="tag-input" id="groupsInput"><input placeholder="输入群名后按回车添加" /></div>
+          <p class="hint">只监听这里列出的群聊，至少添加一个</p>
+          <p class="error-text" id="err-groups"></p>
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label>最小延迟（秒）</label>
+            <input type="number" id="delayMin" step="0.1" min="0" />
+            <p class="error-text" id="err-delayMin"></p>
+          </div>
+          <div class="form-group">
+            <label>最大延迟（秒）</label>
+            <input type="number" id="delayMax" step="0.1" min="0" />
+            <p class="error-text" id="err-delayMax"></p>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="section-title">AI 参数</div>
+        <div class="row">
+          <div class="form-group">
+            <label>消息队列长度</label>
+            <input type="number" id="aiQueueSize" min="0" />
+            <p class="hint">0 表示不限制</p>
+            <p class="error-text" id="err-aiQueueSize"></p>
+          </div>
+          <div class="form-group">
+            <label>上下文长度</label>
+            <input type="number" id="aiContextSize" min="1" />
+            <p class="error-text" id="err-aiContextSize"></p>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>单条回复最大字符数</label>
+          <input type="number" id="aiMaxReplyChars" min="20" />
+          <p class="error-text" id="err-aiMaxReplyChars"></p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="section-title">日志路径</div>
+        <div class="row">
+          <div class="form-group">
+            <label>群聊审计日志</label>
+            <input type="text" id="groupLogRoot" />
+          </div>
+          <div class="form-group">
+            <label>错误日志</label>
+            <input type="text" id="errorLogRoot" />
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-panel" data-tab="ai">
+      <div class="card">
+        <div class="section-title">默认提供商</div>
+        <div class="form-group">
+          <label>默认使用的 Provider</label>
+          <select id="defaultProvider"></select>
+          <p class="hint">将在下方 providers 中定义的某个名称设为默认</p>
+          <p class="error-text" id="err-defaultProvider"></p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="section-title" style="justify-content:space-between">
+          <span>AI 服务提供商</span>
+          <button type="button" class="btn btn-primary btn-sm" onclick="addProvider()">+ 添加 Provider</button>
+        </div>
+        <div id="providersContainer"></div>
+        <p class="error-text" id="err-providers"></p>
+      </div>
+    </div>
+
+    <div class="tab-panel" data-tab="openclaw">
+      <div class="card">
+        <div class="section-title">开关</div>
+        <label class="checkbox">
+          <input type="checkbox" id="ocEnabled" />
+          <span>启用 OpenClaw 双引擎模式</span>
+        </label>
+        <p class="hint">启用后，特定前缀的消息会调用 OpenClaw agent 处理，否则走直接 LLM</p>
+      </div>
+      <div class="card" id="ocBody">
+        <div class="section-title">OpenClaw 参数</div>
+        <div class="row">
+          <div class="form-group">
+            <label>Agent ID</label>
+            <input type="text" id="ocAgentId" />
+          </div>
+          <div class="form-group">
+            <label>超时（秒）</label>
+            <input type="number" id="ocTimeout" min="1" step="1" />
+            <p class="error-text" id="err-ocTimeout"></p>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>触发前缀</label>
+          <div class="tag-input" id="ocPrefixesInput"><input placeholder="输入前缀后按回车添加" /></div>
+          <p class="error-text" id="err-ocPrefixes"></p>
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label class="checkbox">
+              <input type="checkbox" id="ocFallback" />
+              <span>失败时降级到 LLM</span>
+            </label>
+          </div>
+          <div class="form-group">
+            <label class="checkbox">
+              <input type="checkbox" id="ocSessionPerGroup" />
+              <span>每群独立 Session</span>
+            </label>
+          </div>
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label>占位文本</label>
+            <input type="text" id="ocPlaceholder" />
+          </div>
+          <div class="form-group">
+            <label>失败占位回复</label>
+            <input type="text" id="ocPlaceholderFail" />
+          </div>
+        </div>
+        <div class="form-group">
+          <label>CLI 路径</label>
+          <input type="text" id="ocCliPath" />
+          <p class="hint">留空表示从 PATH 自动查找 openclaw</p>
+        </div>
+      </div>
+    </div>
+  </form>
+
+  <div class="footer-actions">
+    <button class="btn btn-secondary" onclick="saveConfig(false)">保存配置</button>
+    <button class="btn btn-primary" id="btnLaunch" onclick="saveConfig(true)">
+      <span id="btnLaunchText">保存并启动</span>
+    </button>
+  </div>
+</div>
+
+<div class="modal" id="modal">
+  <div class="modal-content">
+    <div class="modal-header">
+      <strong>配置预览</strong>
+      <button class="btn btn-secondary btn-sm" onclick="closeModal()">关闭</button>
+    </div>
+    <div class="modal-body"><pre id="modalPre"></pre></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const TOKEN = window.__CONFIG_TOKEN__ || '';
+let initialConfig = window.__INITIAL_CONFIG__ || {};
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+/* ---------- Tag Input ---------- */
+function createTagInput(el, values) {
+  const input = el.querySelector('input');
+  const arr = [...values];
+  function render() {
+    let html = arr.map((v, i) => `<span class="tag">${v}<button type="button" data-i="${i}">&times;</button></span>`).join('');
+    el.querySelectorAll('.tag').forEach(t => t.remove());
+    el.insertAdjacentHTML('afterbegin', html);
+  }
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const v = input.value.trim();
+      if (v && !arr.includes(v)) { arr.push(v); input.value = ''; render(); }
+    }
+  });
+  el.addEventListener('click', e => {
+    if (e.target.tagName === 'BUTTON' && e.target.dataset.i !== undefined) {
+      arr.splice(+e.target.dataset.i, 1); render(); input.focus();
+    }
+  });
+  render();
+  return { get: () => arr, set: (v) => { arr.length = 0; arr.push(...v); render(); } };
+}
+const groupsTags = createTagInput(document.getElementById('groupsInput'), []);
+const ocPrefixesTags = createTagInput(document.getElementById('ocPrefixesInput'), []);
+
+/* ---------- Providers ---------- */
+let providerCounter = 0;
+const providerFields = [
+  {k:'base_url',l:'Base URL',t:'text',r:1},
+  {k:'api_format',l:'API 格式',t:'select',opts:[['completions','completions (OpenAI-compatible)'],['responses','responses (OpenAI Responses)'],['anthropic','anthropic (Claude)']]},
+  {k:'model',l:'模型',t:'text',r:1},
+  {k:'api_key',l:'API Key',t:'password',r:1},
+  {k:'temperature',l:'Temperature',t:'number',attr:'step=0.01 min=0 max=2'},
+  {k:'max_tokens',l:'Max Tokens',t:'number',attr:'min=1'},
+  {k:'timeout',l:'超时（秒）',t:'number',attr:'min=1'},
+  {k:'enable_thinking',l:'Thinking',t:'select',opts:[['','自动（默认）'],['true','启用'],['false','禁用']]}
+];
+
+function buildProviderHTML(id, name, data) {
+  let body = providerFields.map(f => {
+    let val = data && data[f.k] !== undefined ? data[f.k] : '';
+    if (f.t === 'select') {
+      const opts = f.opts.map(o => `<option value="${esc(o[0])}" ${String(val)===o[0]?'selected':''}>${esc(o[1])}</option>`).join('');
+      return `<div class="form-group"><label>${esc(f.l)}</label><select class="pf" data-k="${esc(f.k)}">${opts}</select></div>`;
+    }
+    const hasVal = val !== null && val !== undefined;
+    const attr = (f.attr || '') + ` value="${esc(hasVal ? val : '')}"`;
+    if (f.t === 'password') {
+      return `<div class="form-group"><label>${esc(f.l)}</label><div class="pwd-wrap"><input type="password" class="pf" data-k="${esc(f.k)}" ${attr} ${f.r?'required':''} /><button type="button" class="eye-btn" onclick="togglePwd(this)" title="显示/隐藏">&#128065;</button></div></div>`;
+    }
+    return `<div class="form-group"><label>${esc(f.l)}</label><input type="${esc(f.t)}" class="pf" data-k="${esc(f.k)}" ${attr} ${f.r?'required':''} /></div>`;
+  }).join('');
+  return `
+  <div class="provider-card" data-pid="${esc(id)}">
+    <div class="provider-header" onclick="toggleProvider(this)">
+      <input type="text" class="pname" value="${esc(name||'')}" placeholder="Provider 名称" onclick="event.stopPropagation()" />
+      <span class="toggle">▼</span>
+    </div>
+    <div class="provider-body open">${body}</div>
+    <div class="provider-actions"><button type="button" class="btn btn-danger btn-sm" onclick="removeProvider(this)">删除</button></div>
+  </div>`;
+}
+
+function addProvider(name, data) {
+  const id = 'p' + (++providerCounter);
+  const container = document.getElementById('providersContainer');
+  container.insertAdjacentHTML('beforeend', buildProviderHTML(id, name || '', data || {}));
+  updateDefaultOptions();
+}
+function removeProvider(btn) { btn.closest('.provider-card').remove(); updateDefaultOptions(); }
+function toggleProvider(hdr) {
+  const body = hdr.nextElementSibling;
+  const open = body.classList.toggle('open');
+  hdr.classList.toggle('open', open);
+  hdr.querySelector('.toggle').textContent = open ? '▼' : '▶';
+}
+function togglePwd(btn) {
+  const input = btn.closest('.pwd-wrap').querySelector('input');
+  if (!input) return;
+  const isPwd = input.type === 'password';
+  input.type = isPwd ? 'text' : 'password';
+  btn.classList.toggle('active', !isPwd);
+  btn.title = isPwd ? '隐藏' : '显示';
+}
+function updateDefaultOptions() {
+  const names = [...document.querySelectorAll('.provider-card .pname')].map(i => i.value.trim()).filter(Boolean);
+  const sel = document.getElementById('defaultProvider');
+  const cur = sel.value;
+  sel.innerHTML = names.map(n => `<option value="${esc(n)}" ${n===cur?'selected':''}>${esc(n)}</option>`).join('') || '<option value="">-- 请先添加 Provider --</option>';
+}
+
+/* ---------- Tabs ---------- */
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelector(`.tab-panel[data-tab="${btn.dataset.tab}"]`).classList.add('active');
+  });
+});
+
+/* ---------- Load / Collect ---------- */
+function loadConfig(cfg) {
+  groupsTags.set(Array.isArray(cfg.groups) ? cfg.groups : []);
+  const delay = cfg.reply_delay_range || [2,5];
+  document.getElementById('delayMin').value = delay[0];
+  document.getElementById('delayMax').value = delay[1];
+  document.getElementById('aiQueueSize').value = cfg.ai_queue_size ?? 0;
+  document.getElementById('aiContextSize').value = cfg.ai_context_size ?? 8;
+  document.getElementById('aiMaxReplyChars').value = cfg.ai_max_reply_chars ?? 180;
+  document.getElementById('groupLogRoot').value = cfg.group_log_root ?? 'logs/group_mentions';
+  document.getElementById('errorLogRoot').value = cfg.error_log_root ?? 'logs/errors';
+
+  document.getElementById('providersContainer').innerHTML = '';
+  const providers = cfg.providers || {};
+  Object.entries(providers).forEach(([name, data]) => addProvider(name, data));
+  document.getElementById('defaultProvider').value = cfg.default || '';
+
+  const oc = cfg.openclaw || {};
+  document.getElementById('ocEnabled').checked = !!oc.enabled;
+  document.getElementById('ocAgentId').value = oc.agent_id ?? 'main';
+  ocPrefixesTags.set(Array.isArray(oc.prefixes) ? oc.prefixes : ['/claw','\\claw']);
+  document.getElementById('ocTimeout').value = oc.timeout ?? 60;
+  document.getElementById('ocFallback').checked = oc.fallback_to_llm !== false;
+  document.getElementById('ocSessionPerGroup').checked = oc.session_per_group !== false;
+  document.getElementById('ocPlaceholder').value = oc.placeholder_text ?? '让我想想…';
+  document.getElementById('ocPlaceholderFail').value = oc.placeholder_reply_on_failure ?? '这个我直接来答吧';
+  const cliPathVal = oc.cli_path ?? '';
+  document.getElementById('ocCliPath').value = cliPathVal;
+  toggleOcBody();
+}
+
+function collectConfig() {
+  const providers = {};
+  document.querySelectorAll('.provider-card').forEach(card => {
+    const name = card.querySelector('.pname').value.trim();
+    if (!name) return;
+    const data = {};
+    card.querySelectorAll('.pf').forEach(el => {
+      let v = el.value;
+      const k = el.dataset.k;
+      if (el.type === 'number') v = v === '' ? null : (v.includes('.') ? parseFloat(v) : parseInt(v,10));
+      if (k === 'enable_thinking') v = v === '' ? null : (v === 'true' ? true : false);
+      if (v !== null && v !== undefined) data[k] = v;
+    });
+    providers[name] = data;
+  });
+
+  const ocEnabled = document.getElementById('ocEnabled').checked;
+  const oc = {
+    enabled: ocEnabled,
+    agent_id: document.getElementById('ocAgentId').value.trim() || 'main',
+    prefixes: ocPrefixesTags.get(),
+    timeout: parseFloat(document.getElementById('ocTimeout').value) || 60,
+    fallback_to_llm: document.getElementById('ocFallback').checked,
+    session_per_group: document.getElementById('ocSessionPerGroup').checked,
+    placeholder_text: document.getElementById('ocPlaceholder').value.trim() || '让我想想…',
+    placeholder_reply_on_failure: document.getElementById('ocPlaceholderFail').value.trim() || '这个我直接来答吧',
+    cli_path: document.getElementById('ocCliPath').value.trim(),
+  };
+
+  function safeFloat(v) { const n = parseFloat(v); return isNaN(n) ? v : n; }
+  function safeInt(v) { const n = parseInt(v, 10); return isNaN(n) ? v : n; }
+  return {
+    groups: groupsTags.get(),
+    reply_delay_range: [
+      safeFloat(document.getElementById('delayMin').value),
+      safeFloat(document.getElementById('delayMax').value),
+    ],
+    ai_queue_size: safeInt(document.getElementById('aiQueueSize').value),
+    ai_context_size: safeInt(document.getElementById('aiContextSize').value),
+    ai_max_reply_chars: safeInt(document.getElementById('aiMaxReplyChars').value),
+    group_log_root: document.getElementById('groupLogRoot').value.trim() || 'logs/group_mentions',
+    error_log_root: document.getElementById('errorLogRoot').value.trim() || 'logs/errors',
+    default: document.getElementById('defaultProvider').value.trim(),
+    providers,
+    openclaw: oc,
+  };
+}
+
+/* ---------- UI helpers ---------- */
+function toggleOcBody() {
+  const on = document.getElementById('ocEnabled').checked;
+  document.getElementById('ocBody').style.opacity = on ? '1' : '0.5';
+  document.getElementById('ocBody').style.pointerEvents = on ? 'auto' : 'none';
+}
+document.getElementById('ocEnabled').addEventListener('change', toggleOcBody);
+
+function showToast(msg, type) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast ' + type;
+  requestAnimationFrame(() => t.classList.add('show'));
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+function clearErrors() {
+  document.querySelectorAll('.error-text').forEach(el => { el.textContent = ''; el.style.display = 'none'; });
+  document.querySelectorAll('input, select').forEach(el => el.classList.remove('error'));
+}
+
+function showFieldErrors(errors) {
+  clearErrors();
+  const map = {
+    'groups':'groupsInput','reply_delay_range':'delayMin','ai_queue_size':'aiQueueSize',
+    'ai_context_size':'aiContextSize','ai_max_reply_chars':'aiMaxReplyChars',
+    'default':'defaultProvider','providers':'providersContainer',
+    'openclaw.timeout':'ocTimeout','openclaw.prefixes':'ocPrefixesInput'
+  };
+  for (const [k, msg] of Object.entries(errors)) {
+    let elId = map[k];
+    if (!elId && k.startsWith('providers.')) {
+      const parts = k.split('.');
+      // 高亮对应 provider 卡片
+      const cards = [...document.querySelectorAll('.provider-card')];
+      const card = cards.find(c => c.querySelector('.pname').value.trim() === parts[1]);
+      if (card) {
+        const inp = card.querySelector(`[data-k="${parts[2]}"]`);
+        if (inp) { inp.classList.add('error'); inp.scrollIntoView({block:'center',behavior:'smooth'}); }
+        continue;
+      }
+    }
+    if (elId) {
+      const el = document.getElementById(elId);
+      if (el) {
+        if (el.tagName === 'INPUT' || el.tagName === 'SELECT') el.classList.add('error');
+        const err = document.getElementById('err-' + elId);
+        if (err) { err.textContent = msg; err.style.display = 'block'; }
+      }
+    }
+  }
+}
+
+function setLoading(loading) {
+  const btn = document.getElementById('btnLaunch');
+  const txt = document.getElementById('btnLaunchText');
+  btn.disabled = loading;
+  txt.innerHTML = loading ? '<span class="spinner"></span> 处理中...' : '保存并启动';
+}
+
+/* ---------- Actions ---------- */
+async function saveConfig(launch) {
+  clearErrors();
+  const data = collectConfig();
+  setLoading(true);
+  try {
+    const resp = await fetch('/api/' + (launch ? 'launch' : 'config'), {
+      method: 'POST',
+      headers: {'Content-Type':'application/json','X-Config-Token':TOKEN},
+      body: JSON.stringify(data),
+    });
+    const result = await resp.json();
+    if (!resp.ok) {
+      if (result.details) showFieldErrors(result.details);
+      showToast(result.error || '保存失败', 'error');
+      return;
+    }
+    showToast(launch ? '配置已保存，正在启动...' : '配置已保存', 'success');
+    if (launch) {
+      setTimeout(() => {
+        document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:20px;text-align:center;padding:24px"><div style="width:64px;height:64px;border-radius:50%;background:#dcfce7;display:flex;align-items:center;justify-content:center;font-size:32px">&#10003;</div><div><h2 style="font-size:1.3rem;font-weight:700;color:var(--text);margin-bottom:8px">机器人已启动</h2><p style="color:var(--text-secondary);font-size:.95rem;line-height:1.6">配置已成功保存，wx4py AI 群聊机器人已在后台运行。<br>您可以安全关闭当前配置页面，机器人将继续正常工作。</p></div><p style="color:var(--text-secondary);font-size:.8rem;margin-top:8px">此页面不会再自动跳转或刷新</p></div>';
+      }, 400);
+    }
+  } catch (e) {
+    showToast('网络错误: ' + e.message, 'error');
+  } finally {
+    setLoading(false);
+  }
+}
+
+function previewConfig() {
+  document.getElementById('modalPre').textContent = JSON.stringify(collectConfig(), null, 2);
+  document.getElementById('modal').classList.add('show');
+}
+function closeModal() { document.getElementById('modal').classList.remove('show'); }
+function resetConfig() {
+  if (confirm('确定要重置为初始配置吗？未保存的修改将丢失。')) {
+    loadConfig(initialConfig);
+    clearErrors();
+    showToast('已重置', 'success');
+  }
+}
+
+/* ---------- Init ---------- */
+loadConfig(initialConfig);
+</script>
+</body>
+</html>

@@ -11,6 +11,9 @@ recursive-include examples *.py
 # Include docs
 recursive-include docs *.md
 
+# Include web config static files
+recursive-include src/web_config/static *
+
 # Exclude development files
 recursive-exclude tests *
 recursive-exclude scripts *
