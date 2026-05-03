@@ -128,6 +128,10 @@ with WeChatClient(auto_connect=True) as wx:
 6. 人为断网或填错 API Key，确认 `logs/errors/YYYY-MM-DD.log` 有 AI 错误记录。
 7. 发送失败或发送后聊天区不可见时，确认错误日志出现对应事件。
 
+## 最近更新
+
+- **2026-05-03**：新增引用消息识别能力。群成员引用历史消息后 @ 机器人，AI 能识别被引用的原始内容和发送者并针对性回答。同时修复了切群发送时偶发的 AX 控件竞争卡顿问题。详见 [CHANGELOG](docs/guide/CHANGELOG.md)。
+
 ## 许可证与致谢
 
 本项目沿用 AGPL-3.0-or-later 许可证。感谢 [claw-codes/wx4py](https://github.com/claw-codes/wx4py) 原项目提供灵感、命名和早期自动化思路；当前仓库的 macOS-only 机器人改造不代表原项目官方支持范围。

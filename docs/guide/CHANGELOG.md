@@ -7,6 +7,27 @@
 - `MINOR`：新增功能且保持兼容
 - `MAJOR`：存在破坏性变更
 
+## [macOS-only] - 2026-05-03
+
+### 新增
+
+- **引用消息识别**：群成员引用历史消息后 @ 机器人，AI 能识别被引用的原始内容和发送者，并针对被引用内容回答。支持从左侧会话列表预览和聊天窗口消息气泡两种途径提取引用信息。
+- 新增 `_fetch_quote_from_chat` 方法，在左侧预览未包含引用内容时，临时打开聊天窗口读取消息气泡提取引用。
+- `MessageEvent` 新增 `quoted_sender` 和 `quoted_content` 字段，AI 提示词中明确告知模型"被引用的内容已直接提供，不需要再去上下文里找"。
+
+### 优化
+
+- `_fetch_quote_from_chat` 性能优化：将固定 `sleep(0.8)` 改为 `sleep(0.3)` 配合重试机制，减少扫描线程阻塞时间。
+- 避免重复切群：`_fetch_quote_from_chat` 点击切群后更新 `self._current_send_group`，发送流程可直接复用当前窗口。
+- 读取聊天气泡时优先匹配发送者和内容，避免读到非目标消息的引用。
+- 将内部诊断日志从 `info` 降级为 `debug`，减少日志噪音。
+
+### 修复
+
+- 修复 `_parse_quote_from_text` 解析微信气泡 `name` 时 `sender` 被错误解析为包含回复前缀的混乱字符串的问题（新增 pattern0 专门匹配 `引用 X 的消息 : Y` 格式）。
+- 修复切群发送时偶发的 AX 控件竞争卡顿问题：将 `GROUP_SWITCH_FALLBACK_ACCEPT_SECONDS` 从 `0.2` 秒增加到 `0.5` 秒，给 macOS 微信控件树足够重建时间。
+- 修复 `_fetch_quote_from_chat` 中错误调用未定义函数 `_find_chat_message_list` 的问题（改为 `_find_message_list`）。
+
 ## [macOS-only] - 2026-05-02
 
 本版本将项目主线重构为 macOS 微信群 @ AI 自动回复机器人，不再保留可运行的 Windows 后端。
