@@ -253,6 +253,8 @@ class AsyncCallbackHandler(CallbackHandler):
             sender_nickname=event.sender_nickname,
             is_at_me=event.is_at_me,
             raw=None,
+            quoted_sender=getattr(event, "quoted_sender", None),
+            quoted_content=getattr(event, "quoted_content", None),
         )
 
     def stop(self) -> None:

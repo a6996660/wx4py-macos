@@ -474,6 +474,12 @@ class AIResponder:
     @staticmethod
     def _format_user_content(event: MessageEvent, content: str) -> str:
         sender = (event.sender_nickname or "").strip()
+        quoted_sender = getattr(event, "quoted_sender", None) or ""
+        quoted_content = getattr(event, "quoted_content", None) or ""
+        if quoted_content:
+            if quoted_sender and quoted_sender not in {"我", "你"}:
+                return f"{sender}引用了\"{quoted_sender}\"的话:\"{quoted_content}\"，然后问: \"{content}\""
+            return f"{sender}引用了一句话:\"{quoted_content}\"，然后问: \"{content}\""
         return AIResponder._format_content(sender, content)
 
     @staticmethod
@@ -512,7 +518,10 @@ class AIResponder:
                 f"本次回复请控制在 {max_reply_chars} 个中文字符以内，优先自然收尾，不要靠突然截断变短。\n"
                 "本次回复要更像微信群里的真人朋友：先接住对方，再给答案；不要自称机器人、AI 或模型。\n"
                 "如果用户问上一句、刚才、前面的人说了什么，只能回答本群上下文里的内容；"
-                "不要使用其他群聊或服务端记忆。"
+                "不要使用其他群聊或服务端记忆。\n"
+                "如果用户消息里明确包含\"引用了...的话\"，说明这是一条引用消息回复；"
+                "被引用的内容已经直接提供在消息中，不需要再去上下文里找。"
+                "回答时要针对被引用的内容本身，而不是上下文里的其他消息。"
             ),
         }
 

@@ -40,7 +40,7 @@ GROUP_SWITCH_ATTEMPT_LIMIT = 3
 GROUP_SWITCH_WAIT_SECONDS = 0.8
 SEND_VERIFY_TIMEOUT = 0.8
 RECOVERY_PAUSE_SECONDS = 0.25
-GROUP_SWITCH_FALLBACK_ACCEPT_SECONDS = 0.2
+GROUP_SWITCH_FALLBACK_ACCEPT_SECONDS = 0.5
 DETACHED_WINDOW_CHECK_INTERVAL = 0.25
 QUICK_EXISTS_TIMEOUT = 0.08
 
@@ -59,6 +59,8 @@ class MessageEvent:
     sender_nickname: Optional[str] = None
     is_at_me: bool = False
     raw: object = None
+    quoted_content: Optional[str] = None
+    quoted_sender: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -604,6 +606,68 @@ def _extract_sender_from_session_item(control, group_name: str) -> Optional[str]
     return None
 
 
+def _parse_quote_from_text(text: str) -> Tuple[Optional[str], Optional[str], str]:
+    """尝试从消息文本中解析引用内容。
+
+    支持多种可能的引用格式：
+      - [引用 发送者: 内容] 回复
+      - [引用 发送者：内容] 回复
+      - 发送者: 内容 | 回复
+      - 发送者: 内容\n回复
+
+    Returns:
+        (quoted_sender, quoted_content, remaining_text)
+    """
+    if not text:
+        return None, None, text
+
+    # 模式 0: 微信气泡/预览中的引用格式
+    # 例如: "@豆角他说什么引用 爸爸 的消息 : 车没这么便宜，估计要 500"
+    pattern0 = re.compile(
+        r'引用\s+(.+?)\s+的消息\s*[:：]\s*(.*?)(?:\n|$)',
+        re.DOTALL
+    )
+    m = pattern0.search(text)
+    if m:
+        sender = m.group(1).strip()
+        content = m.group(2).strip()
+        if sender and content:
+            return sender, content, ""
+
+    # 模式 1: [引用 发送者: 内容] 回复  /  [引用 发送者：内容] 回复
+    pattern1 = re.compile(
+        r'^\[引用\s+([^:\]]+?)[:：]\s*(.*?)\]\s*(.*)$',
+        re.DOTALL
+    )
+    m = pattern1.match(text)
+    if m:
+        return m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+
+    # 模式 2: 微信预览中直接拼接的引用，尝试用 "回复" 关键词分割
+    # 例如: "爸爸: 哪里有北京有趣 回复: 他说的什么"
+    pattern2 = re.compile(
+        r'^(.*?)(?:\n|\r| 回复[:：]?\s*|\s+回复[:：]?\s+)(.*)$',
+        re.DOTALL
+    )
+    m = pattern2.match(text)
+    if m:
+        possible_quote = m.group(1).strip()
+        reply_text = m.group(2).strip()
+        # 如果引用部分包含 "说:" 或 ":"，尝试提取发送者
+        if ':' in possible_quote or '：' in possible_quote:
+            sep = ':' if ':' in possible_quote else '：'
+            parts = possible_quote.split(sep, 1)
+            sender = parts[0].strip()
+            content = parts[1].strip()
+            if sender and content and len(sender) < 24:
+                return sender, content, reply_text
+        # 如果没有明确的发送者，但内容看起来像引用（较长且以标点结尾）
+        if len(possible_quote) > 3 and possible_quote[-1] in '。！？.!?':
+            return None, possible_quote, reply_text
+
+    return None, None, text
+
+
 def _extract_message_from_session_item(control, group_name: str) -> Optional[str]:
     """从左侧会话预览中解析最新 @ 消息正文。"""
     name = _safe_text(control, "Name")
@@ -842,20 +906,52 @@ class WeChatGroupListener:
             if not content:
                 self._update_next_scan(session, 0)
                 return
-            normalized_text = _normalize_message_text(content)
+
+            # 记录原始 UIA Name，帮助验证引用消息实际格式
+            raw_name = _safe_text(session_item, "Name")
+            logger.debug(
+                "引用调试: group=%s, raw_name=%r, extracted_content=%r",
+                session.group, raw_name, content,
+            )
+
+            quoted_sender, quoted_content, clean_content = _parse_quote_from_text(content)
+            if quoted_content:
+                logger.info(
+                    "引用解析成功: group=%s, quoted_sender=%r, quoted_content=%r, clean=%r",
+                    session.group, quoted_sender, quoted_content, clean_content,
+                )
+
+            # 左侧预览未包含引用内容时，尝试从聊天窗口消息气泡读取
+            if not quoted_content:
+                bubble_sender, bubble_content = self._fetch_quote_from_chat(
+                    session,
+                    sender_nickname=sender_nickname,
+                    clean_content=clean_content,
+                )
+                if bubble_content:
+                    quoted_sender = bubble_sender
+                    quoted_content = bubble_content
+                    logger.info(
+                        "从聊天气泡获取引用: group=%s, quoted_sender=%r, quoted_content=%r",
+                        session.group, quoted_sender, quoted_content,
+                    )
+
+            normalized_text = _normalize_message_text(clean_content)
             if normalized_text:
                 if normalized_text in session.seen_texts:
                     self._update_next_scan(session, 0)
                     return
                 session.seen_texts.add(normalized_text)
-            if self.ignore_client_sent and self.outgoing_registry.should_ignore(session.group, content):
+            if self.ignore_client_sent and self.outgoing_registry.should_ignore(session.group, clean_content):
                 self._update_next_scan(session, 0)
                 return
             self._handle_text_message(
                 session,
-                content,
+                clean_content,
                 sender_nickname=sender_nickname,
                 at_hint=True,
+                quoted_sender=quoted_sender,
+                quoted_content=quoted_content,
             )
             session.at_hint_pending = False
             session.at_hint_sender = None
@@ -866,12 +962,193 @@ class WeChatGroupListener:
             logger.debug(f"读取群聊消息失败: {session.group}: {exc}")
             return
 
+    def _fetch_quote_from_chat(
+        self,
+        session: _ListenSession,
+        sender_nickname: Optional[str] = None,
+        clean_content: str = "",
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """点击打开群聊，读取最新消息气泡，尝试提取引用内容。
+
+        注意：这会临时切换当前聊天窗口到目标群聊。
+        """
+        try:
+            # 获取左侧会话项并点击打开群聊
+            root = platform.automation.control_from_handle(self.client.window.hwnd)
+            session_item = _find_session_item(root, session.group)
+            if not session_item:
+                logger.debug("获取引用: 未找到会话项 group=%s", session.group)
+                return None, None
+
+            # 如果当前聊天窗口已经在目标群，跳过点击
+            if _current_chat_title_matches(root, session.group):
+                logger.debug("获取引用: 当前已在目标群，跳过点击 group=%s", session.group)
+            else:
+                logger.debug("获取引用: 点击打开群聊 group=%s", session.group)
+                _click_session_item(session_item)
+                time.sleep(0.3)
+                # 更新发送状态，避免后续发送流程重复切群导致 AX 竞争
+                self._current_send_group = session.group
+                self._current_send_group_at = time.time()
+                try:
+                    session.root = platform.automation.control_from_handle(self.client.window.hwnd)
+                except Exception:
+                    pass
+
+            # 重新获取 root，查找消息列表（带重试）
+            msg_list = None
+            for attempt in range(3):
+                root = platform.automation.control_from_handle(self.client.window.hwnd)
+                msg_list = _find_message_list(root)
+                if msg_list:
+                    break
+                time.sleep(0.3)
+
+            if not msg_list:
+                logger.debug("获取引用: 未找到消息列表 group=%s", session.group)
+                return None, None
+
+            children = list(msg_list.GetChildren())
+            if not children:
+                logger.debug("获取引用: 消息列表为空 group=%s", session.group)
+                return None, None
+
+            logger.debug("获取引用: 消息列表共 %d 条 group=%s", len(children), session.group)
+
+            # 辅助函数：从单个子控件解析引用
+            def _try_parse_child(child) -> Tuple[Optional[str], Optional[str]]:
+                cls = _safe_text(child, "ClassName")
+                auto_id = _safe_text(child, "AutomationId")
+                name = _safe_text(child, "Name")
+                logger.debug(
+                    "获取引用: 检查子控件 class=%r auto_id=%r name=%.80r group=%s",
+                    cls, auto_id, name, session.group,
+                )
+                if cls not in MESSAGE_CLASSES and auto_id != MACOS_MESSAGE_AUTOMATION_ID:
+                    return None, None
+                if not name:
+                    logger.debug("获取引用: 子控件 name 为空，跳过 group=%s", session.group)
+                    return None, None
+                logger.debug("气泡原始文本: group=%s, name=%r", session.group, name)
+                qs, qc, _ = _parse_quote_from_text(name)
+                if qc:
+                    logger.info("气泡引用解析成功: sender=%r, content=%r", qs, qc)
+                    return qs, qc
+                result = self._extract_quote_from_bubble(name)
+                if result[1]:
+                    logger.info("气泡引用解析成功(换行): sender=%r, content=%r", result[0], result[1])
+                    return result
+                return None, None
+
+            # 第一轮：优先匹配发送者和内容都对应的气泡
+            if sender_nickname and clean_content:
+                for child in reversed(children[-10:]):
+                    name = _safe_text(child, "Name")
+                    if sender_nickname in name and clean_content in name:
+                        logger.debug(
+                            "获取引用: 匹配到目标气泡 sender=%r content=%.40r group=%s",
+                            sender_nickname, clean_content, session.group,
+                        )
+                        result = _try_parse_child(child)
+                        if result[1]:
+                            return result
+
+            # 第二轮：fallback 到最新一条文本/气泡消息
+            for child in reversed(children[-10:]):
+                result = _try_parse_child(child)
+                if result[1]:
+                    return result
+
+            logger.debug("获取引用: 遍历 %d 条消息未找到引用内容 group=%s", min(len(children), 10), session.group)
+            return None, None
+        except Exception as exc:
+            logger.warning("读取聊天引用内容失败: %s: %s", session.group, exc)
+            return None, None
+
+    @staticmethod
+    def _extract_quote_from_bubble(name: str) -> Tuple[Optional[str], Optional[str]]:
+        """从消息气泡 Name 属性中提取引用内容，支持多种微信格式。"""
+        if not name or '\n' not in name:
+            return None, None
+
+        lines = [l.strip() for l in name.split('\n') if l.strip()]
+        if len(lines) < 2:
+            return None, None
+
+        # 格式推测 1: 微信引用消息常见格式
+        # 引用
+        # 发送者
+        # 被引用内容
+        # 回复内容
+        if lines[0] in {"引用", "Reply", "Re", "⤷"}:
+            reply_idx = None
+            for i, line in enumerate(lines):
+                if '@' in line and i > 0:
+                    reply_idx = i
+                    break
+            if reply_idx is None:
+                reply_idx = len(lines) - 1
+            if reply_idx > 1:
+                quote_lines = lines[1:reply_idx]
+                sender = None
+                if quote_lines:
+                    first = quote_lines[0]
+                    if len(first) <= 20 and not any(p in first for p in '。！？.!?；;：:,，'):
+                        sender = first
+                        quote_lines = quote_lines[1:]
+                quote_content = '\n'.join(quote_lines)
+                if quote_content:
+                    return sender, quote_content
+
+        # 格式推测 2: 被引用内容和回复内容直接换行分隔
+        # 发送者: 被引用内容
+        # 回复内容（含 @）
+        for i in range(len(lines) - 1, 0, -1):
+            line = lines[i]
+            if '@' in line:
+                quote_lines = lines[:i]
+                sender = None
+                content_parts = []
+                for ql in quote_lines:
+                    if (':' in ql or '：' in ql) and not sender:
+                        sep = ':' if ':' in ql else '：'
+                        parts = ql.split(sep, 1)
+                        ps = parts[0].strip()
+                        pc = parts[1].strip()
+                        if ps and pc and len(ps) < 24:
+                            sender = ps
+                            content_parts.append(pc)
+                        else:
+                            content_parts.append(ql)
+                    else:
+                        content_parts.append(ql)
+                quote_content = '\n'.join(content_parts)
+                if quote_content:
+                    return sender, quote_content
+
+        # 格式推测 3: 只有两行，第一行是被引用内容，第二行是回复
+        if len(lines) == 2:
+            first = lines[0]
+            if ':' in first or '：' in first:
+                sep = ':' if ':' in first else '：'
+                parts = first.split(sep, 1)
+                if len(parts) == 2:
+                    sender = parts[0].strip()
+                    content = parts[1].strip()
+                    if sender and content and len(sender) < 24:
+                        return sender, content
+            return None, first
+
+        return None, None
+
     def _handle_text_message(
         self,
         session: _ListenSession,
         content: str,
         at_hint: bool = False,
         sender_nickname: Optional[str] = None,
+        quoted_sender: Optional[str] = None,
+        quoted_content: Optional[str] = None,
     ) -> None:
         event = MessageEvent(
             group=session.group,
@@ -883,6 +1160,8 @@ class WeChatGroupListener:
                 at_hint and not self.group_nicknames.get(session.group)
             ),
             raw=None,
+            quoted_sender=quoted_sender,
+            quoted_content=quoted_content,
         )
         try:
             reply = self.on_message(event)
@@ -900,16 +1179,19 @@ class WeChatGroupListener:
         at_hint: bool = False,
         sender_nickname: Optional[str] = None,
     ) -> None:
+        quoted_sender, quoted_content, clean_content = _parse_quote_from_text(item.name)
         event = MessageEvent(
             group=session.group,
-            content=item.name,
+            content=clean_content,
             timestamp=time.time(),
             group_nickname=self.group_nicknames.get(session.group),
             sender_nickname=sender_nickname,
-            is_at_me=self._is_at_me(session.group, item.name) or (
+            is_at_me=self._is_at_me(session.group, clean_content) or (
                 at_hint and not self.group_nicknames.get(session.group)
             ),
             raw=item.control,
+            quoted_sender=quoted_sender,
+            quoted_content=quoted_content,
         )
         try:
             reply = self.on_message(event)
