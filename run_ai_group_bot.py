@@ -25,7 +25,16 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
-from src import AIClient, AIConfig, AIResponder, AsyncCallbackHandler, WeChatClient
+from src import (
+    AIClient,
+    AIConfig,
+    AIResponder,
+    AsyncCallbackHandler,
+    HybridResponder,
+    OpenClawClient,
+    OpenClawConfig,
+    WeChatClient,
+)
 
 
 DEFAULT_CONFIG_FILE = "wx4py_ai_config.json"
@@ -158,6 +167,11 @@ def _configure_error_log_root(config: Dict[str, Any]) -> str:
     return value
 
 
+def _load_openclaw_config(config: Dict[str, Any]) -> OpenClawConfig:
+    """读取 OpenClaw 配置节，缺失时返回默认禁用状态。"""
+    return OpenClawConfig.from_dict(config.get("openclaw"))
+
+
 def _lock_path(config_file: Path) -> Path:
     """锁文件放在配置文件同目录，便于多项目并行时相互隔离。"""
     return config_file.parent / DEFAULT_LOCK_FILE
@@ -180,6 +194,19 @@ def main() -> None:
                 # AIConfig.from_file 会读取 providers/default，并支持环境变量覆盖。
                 ai = AIClient(AIConfig.from_file(str(config_file)))
 
+                # OpenClaw 配置与健康检查
+                openclaw_cfg = _load_openclaw_config(raw_config)
+                if openclaw_cfg.enabled:
+                    healthy, health_msg = OpenClawClient.check_health(
+                        cli_path=openclaw_cfg.cli_path
+                    )
+                    if not healthy:
+                        print(f"⚠️  OpenClaw 健康检查失败: {health_msg}", file=sys.stderr)
+                        print("    OpenClaw 模式已自动禁用，仅使用 LLM 秒回。", file=sys.stderr)
+                        openclaw_cfg = OpenClawConfig(enabled=False)
+                    else:
+                        print(f"✅ OpenClaw 健康检查通过: {health_msg}")
+
                 print(f"配置文件: {config_file}")
                 print(f"监听群聊: {', '.join(groups)}")
                 print(f"回复随机延迟: {reply_delay_range[0]:.1f} - {reply_delay_range[1]:.1f} 秒")
@@ -190,16 +217,30 @@ def main() -> None:
                 print(f"关键错误日志: {error_log_root}")
                 print(f"单实例锁: {_lock_path(config_file)}")
                 print(f"阻止系统睡眠: {'已启用 caffeinate' if sleep_prevented else '未启用'}")
+                if openclaw_cfg.enabled:
+                    print(f"🦞 双引擎模式: LLM 秒回 + OpenClaw agent")
+                    print(f"    OpenClaw 前缀: {', '.join(openclaw_cfg.prefixes)}")
+                    print(f"    OpenClaw 超时: {openclaw_cfg.timeout} 秒")
+                else:
+                    print("🤖 单引擎模式: LLM 秒回")
                 print("启动中：只有被 @ 时才会调用大模型回复。按 Ctrl+C 停止。")
 
                 with WeChatClient(auto_connect=True) as wx:
-                    responder = AIResponder(
+                    ai_responder = AIResponder(
                         ai,
                         context_size=ai_context_size,
                         reply_on_at=True,
                         max_reply_chars=ai_max_reply_chars,
                     )
-                    loaded_context = responder.seed_context_from_group_logs(
+                    if openclaw_cfg.enabled:
+                        responder = HybridResponder(
+                            ai_responder,
+                            openclaw_client=OpenClawClient(openclaw_cfg),
+                            openclaw_config=openclaw_cfg,
+                        )
+                    else:
+                        responder = ai_responder
+                    loaded_context = ai_responder.seed_context_from_group_logs(
                         groups,
                         log_root=group_log_root,
                     )

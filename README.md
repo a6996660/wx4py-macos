@@ -130,7 +130,7 @@ with WeChatClient(auto_connect=True) as wx:
 
 ## 最近更新
 
-- **2026-05-03**：新增引用消息识别能力。群成员引用历史消息后 @ 机器人，AI 能识别被引用的原始内容和发送者并针对性回答。同时修复了切群发送时偶发的 AX 控件竞争卡顿问题。详见 [CHANGELOG](docs/guide/CHANGELOG.md)。
+- **2026-05-03**：新增 OpenClaw 本地 agent 双引擎模式。普通 @ 消息继续走 LLM 秒回；带 `/claw` 前缀的 @ 消息自动转给本地 OpenClaw agent 处理（支持工具调用，能力更强），失败时自动降级回 LLM。同时新增引用消息识别能力、修复切群发送偶发卡顿问题。详见 [CHANGELOG](docs/guide/CHANGELOG.md)。
 
 ## 许可证与致谢
 

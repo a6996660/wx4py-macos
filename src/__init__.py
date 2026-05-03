@@ -8,6 +8,13 @@ wx4py - Python 微信自动化工具
 from ._version import __version__
 from .ai import AIClient, AIConfig, AIResponder
 from .client import WeChatClient
+from .openclaw_client import (
+    HybridResponder,
+    OpenClawClient,
+    OpenClawConfig,
+    OpenClawError,
+    OpenClawNotFoundError,
+)
 from .features.messaging.forwarder import (
     ForwardPayload,
     ForwardRuleHandler,
@@ -39,6 +46,11 @@ __all__ = [
     "AIClient",
     "AIConfig",
     "AIResponder",
+    "OpenClawClient",
+    "OpenClawConfig",
+    "HybridResponder",
+    "OpenClawError",
+    "OpenClawNotFoundError",
     "MessageEvent",
     "WeChatGroupListener",
     "MessageAction",

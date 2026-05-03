@@ -549,8 +549,10 @@ class AIResponder:
                 .replace(f"@{group_nickname} ", "")
                 .replace(f"@{group_nickname}", "")
             )
-        max_chars = max(20, int(max_chars or 180))
-        if len(reply) > max_chars:
+        if max_chars is None:
+            max_chars = 180
+        max_chars = int(max_chars)
+        if max_chars > 0 and len(reply) > max_chars:
             reply = AIResponder._trim_at_sentence_boundary(reply, max_chars)
         return reply.strip()
 

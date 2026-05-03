@@ -32,5 +32,17 @@
       "max_tokens": 220,
       "timeout": 20
     }
+  },
+  "openclaw": {
+    "_说明": "OpenClaw 本地 agent 配置。启用后，@消息以指定前缀开头时会调用 OpenClaw agent 处理（慢但能力强），否则走直接 LLM（秒回）。",
+    "enabled": false,
+    "agent_id": "main",
+    "prefixes": ["/claw", "\\claw"],
+    "timeout": 60,
+    "fallback_to_llm": true,
+    "session_per_group": true,
+    "placeholder_text": "让我想想…",
+    "placeholder_reply_on_failure": "这个我直接来答吧",
+    "cli_path": "/Users/xxx/.nvm/versions/node/v22.22.1/bin/openclaw"
   }
 }
