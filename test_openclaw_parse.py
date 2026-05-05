@@ -1,7 +1,17 @@
 # -*- coding: utf-8 -*-
 """OpenClaw JSON 解析 mock 验证（阻塞项）。"""
 
-from src.openclaw_client import OpenClawClient, OpenClawAgentError, OpenClawTimeoutError
+import os
+import tempfile
+import time
+from pathlib import Path
+
+from src.openclaw_client import (
+    OpenClawClient,
+    OpenClawAgentError,
+    OpenClawTimeoutError,
+    OpenClawResult,
+)
 
 
 def test_case_1_stdout_json():
@@ -110,7 +120,7 @@ def test_case_9_payloads_format():
 # HybridResponder 前缀路由与降级测试
 # ---------------------------------------------------------------------------
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from src.openclaw_client import HybridResponder, OpenClawConfig, OpenClawClient, OpenClawAgentError
 from src.ai import AIResponder
@@ -136,7 +146,9 @@ def test_hybrid_prefix_match():
     ai_resp.return_value = "LLM reply"
 
     oc_client = MagicMock(spec=OpenClawClient)
-    oc_client.run_agent.return_value = "OpenClaw reply"
+    oc_client.run_agent_full.return_value = OpenClawResult(
+        text="OpenClaw reply", file_paths=[]
+    )
 
     cfg = OpenClawConfig(enabled=True, prefixes=["/claw"])
     hybrid = HybridResponder(ai_resp, openclaw_client=oc_client, openclaw_config=cfg)
@@ -144,9 +156,10 @@ def test_hybrid_prefix_match():
     event = _make_event("@机器人 /claw 查邮件")
     result = hybrid(event)
 
-    assert result == "OpenClaw reply", f"Expected OpenClaw reply, got: {result}"
-    oc_client.run_agent.assert_called_once()
-    args, kwargs = oc_client.run_agent.call_args
+    assert isinstance(result, OpenClawResult)
+    assert result.text == "OpenClaw reply", f"Expected OpenClaw reply, got: {result}"
+    oc_client.run_agent_full.assert_called_once()
+    args, kwargs = oc_client.run_agent_full.call_args
     assert "查邮件" in args[0]
     ai_resp.assert_not_called()
     print("✅ Hybrid test passed: prefix routes to OpenClaw")
@@ -178,7 +191,7 @@ def test_hybrid_fallback():
     ai_resp.return_value = "LLM fallback reply"
 
     oc_client = MagicMock(spec=OpenClawClient)
-    oc_client.run_agent.side_effect = OpenClawAgentError("502 error")
+    oc_client.run_agent_full.side_effect = OpenClawAgentError("502 error")
 
     cfg = OpenClawConfig(enabled=True, prefixes=["/claw"], fallback_to_llm=True)
     hybrid = HybridResponder(ai_resp, openclaw_client=oc_client, openclaw_config=cfg)
@@ -187,7 +200,7 @@ def test_hybrid_fallback():
     result = hybrid(event)
 
     assert result == "LLM fallback reply", f"Expected fallback, got: {result}"
-    oc_client.run_agent.assert_called_once()
+    oc_client.run_agent_full.assert_called_once()
     ai_resp.assert_called_once()
     print("✅ Hybrid test passed: fallback to LLM on OpenClaw error")
 
@@ -215,7 +228,7 @@ def test_hybrid_session_isolation():
     ai_resp.reply_on_at = True
 
     oc_client = MagicMock(spec=OpenClawClient)
-    oc_client.run_agent.return_value = "ok"
+    oc_client.run_agent_full.return_value = OpenClawResult(text="ok", file_paths=[])
 
     cfg = OpenClawConfig(enabled=True, prefixes=["/claw"], session_per_group=True)
     hybrid = HybridResponder(ai_resp, openclaw_client=oc_client, openclaw_config=cfg)
@@ -225,12 +238,371 @@ def test_hybrid_session_isolation():
     hybrid(event1)
     hybrid(event2)
 
-    calls = oc_client.run_agent.call_args_list
+    calls = oc_client.run_agent_full.call_args_list
     assert len(calls) == 2
     # session_id 应不同
     assert calls[0].kwargs["session_id"] != calls[1].kwargs["session_id"]
     print("✅ Hybrid test passed: session isolation per group")
 
+
+# ---------------------------------------------------------------------------
+# OpenClawResult 复合结果解析测试
+# ---------------------------------------------------------------------------
+
+
+def test_extract_result_full_payloads_file():
+    data = {
+        "payloads": [
+            {"type": "text", "text": "  分析结果如下  "},
+            {"type": "file", "file_path": "/tmp/report.pdf"},
+        ]
+    }
+    result = OpenClawClient._extract_result_full(data)
+    assert result.text == "分析结果如下"
+    assert result.file_paths == ["/tmp/report.pdf"]
+    print("✅ ExtractResultFull test passed: payloads with file")
+
+
+def test_extract_result_full_top_level_file_paths():
+    data = {
+        "text": "done",
+        "file_paths": ["/tmp/a.png", "/tmp/b.docx"],
+    }
+    result = OpenClawClient._extract_result_full(data)
+    assert result.text == "done"
+    assert result.file_paths == ["/tmp/a.png", "/tmp/b.docx"]
+    print("✅ ExtractResultFull test passed: top-level file_paths")
+
+
+def test_extract_result_full_backward_compat():
+    data = {"reply": "legacy text"}
+    result = OpenClawClient._extract_result_full(data)
+    assert result.text == "legacy text"
+    assert result.file_paths == []
+    print("✅ ExtractResultFull test passed: backward compatibility")
+
+
+def test_parse_result_full_mixed_stderr():
+    import json
+    stdout = b""
+    stderr = (
+        b"Config warnings:\n"
+        + json.dumps(
+            {
+                "payloads": [
+                    {"type": "text", "text": "report"},
+                    {"type": "file", "file_path": "/tmp/f.pdf"},
+                ]
+            }
+        ).encode("utf-8")
+    )
+    result = OpenClawClient._parse_result_full(stdout, stderr)
+    assert result.text == "report"
+    assert result.file_paths == ["/tmp/f.pdf"]
+    print("✅ ParseResultFull test passed: mixed stderr with file payload")
+
+
+def test_scan_workspace_recent_files_excludes_input_copy():
+    """最近文件兜底不能把复制到 workspace 的输入附件当成输出文件。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        workspace_files = home / ".openclaw" / "workspace" / ".wx4py_files"
+        workspace_files.mkdir(parents=True)
+
+        original = home / "Downloads" / "input.docx"
+        original.parent.mkdir()
+        original.write_text("original", encoding="utf-8")
+
+        input_copy = workspace_files / "input.docx"
+        input_copy.write_text("copied input", encoding="utf-8")
+
+        old_output = workspace_files / "old_output.docx"
+        old_output.write_text("old", encoding="utf-8")
+
+        started_at = time.time() - 10
+        os.utime(old_output, (started_at - 5, started_at - 5))
+        os.utime(input_copy, (started_at + 1, started_at + 1))
+
+        real_output = workspace_files / "real_output.docx"
+        real_output.write_text("new", encoding="utf-8")
+        os.utime(real_output, (started_at + 2, started_at + 2))
+
+        cfg = OpenClawConfig(enabled=True)
+        hybrid = HybridResponder(
+            MagicMock(spec=AIResponder),
+            openclaw_client=None,
+            openclaw_config=cfg,
+        )
+
+        with patch("src.openclaw_client.Path.home", return_value=home):
+            result = hybrid._scan_workspace_recent_files(
+                str(original),
+                workspace_input_path=str(input_copy),
+                started_at=started_at,
+                max_age_seconds=120,
+            )
+
+        assert str(input_copy) not in result
+        assert str(old_output) not in result
+        assert result == [str(real_output)]
+        print("✅ Workspace scan test passed: excludes input copy and pre-existing files")
+
+
+def test_extract_file_paths_from_text_chinese_punctuation():
+    """文本中纯文件名后接中文标点时，也应能反查到 workspace 文件。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        workspace_files = home / ".openclaw" / "workspace" / ".wx4py_files"
+        workspace_files.mkdir(parents=True)
+        output = workspace_files / "表单号_9.docx"
+        output.write_text("docx", encoding="utf-8")
+
+        text = "好了，文件已是序号 9。对应路径：我核对过，表单号_9.docx，和原文件内容一致。"
+        with patch("src.openclaw_client.Path.home", return_value=home):
+            result = HybridResponder._extract_file_paths_from_text(text)
+
+        assert result == [str(output)]
+        print("✅ Text path extraction test passed: Chinese punctuation boundary")
+
+
+# ---------------------------------------------------------------------------
+# HybridResponder OpenClawResult 返回测试
+# ---------------------------------------------------------------------------
+
+
+def test_hybrid_returns_openclaw_result():
+    ai_resp = MagicMock(spec=AIResponder)
+    ai_resp.reply_on_at = True
+
+    oc_client = MagicMock(spec=OpenClawClient)
+    oc_client.run_agent_full.return_value = OpenClawResult(
+        text="OpenClaw text", file_paths=["/tmp/out.txt"]
+    )
+
+    cfg = OpenClawConfig(enabled=True, prefixes=["/claw"])
+    hybrid = HybridResponder(ai_resp, openclaw_client=oc_client, openclaw_config=cfg)
+
+    event = _make_event("@机器人 /claw 生成报告")
+    result = hybrid(event)
+
+    assert isinstance(result, OpenClawResult)
+    assert result.text == "OpenClaw text"
+    assert result.file_paths == ["/tmp/out.txt"]
+    oc_client.run_agent_full.assert_called_once()
+    ai_resp.assert_not_called()
+    print("✅ Hybrid test passed: returns OpenClawResult with files")
+
+
+# ---------------------------------------------------------------------------
+# CallbackHandler OpenClawResult 动作构建测试
+# ---------------------------------------------------------------------------
+
+
+def test_callback_handler_build_actions_openclaw_result():
+    from src.features.messaging.processor import CallbackHandler, ReplyAction, FileReplyAction
+
+    def _callback(event):
+        return OpenClawResult(
+            text="AI reply", file_paths=["/tmp/a.txt", "/tmp/b.txt"]
+        )
+
+    handler = CallbackHandler(_callback, auto_reply=True, reply_on_at=True)
+    event = _make_event("@机器人 /claw 生成文件")
+    actions = handler.handle(event)
+
+    assert isinstance(actions, list)
+    assert len(actions) == 3
+    assert isinstance(actions[0], ReplyAction)
+    assert "AI reply" in actions[0].content
+    assert isinstance(actions[1], FileReplyAction)
+    assert actions[1].file_path == "/tmp/a.txt"
+    assert isinstance(actions[2], FileReplyAction)
+    assert actions[2].file_path == "/tmp/b.txt"
+    print("✅ CallbackHandler test passed: builds ReplyAction + FileReplyAction from OpenClawResult")
+
+
+def test_callback_handler_build_actions_files_only():
+    from src.features.messaging.processor import CallbackHandler, FileReplyAction
+
+    def _callback(event):
+        return OpenClawResult(text="", file_paths=["/tmp/x.png"])
+
+    handler = CallbackHandler(_callback, auto_reply=True, reply_on_at=True)
+    event = _make_event("@机器人 /claw 仅文件")
+    actions = handler.handle(event)
+
+    assert isinstance(actions, list)
+    assert len(actions) == 1
+    assert isinstance(actions[0], FileReplyAction)
+    assert actions[0].file_path == "/tmp/x.png"
+    print("✅ CallbackHandler test passed: files only when text is empty")
+
+
+# ---------------------------------------------------------------------------
+# 附件文本解析测试
+# ---------------------------------------------------------------------------
+
+
+def test_parse_attachment_from_text():
+    from src.features.messaging.listener import _parse_attachment_from_text
+    assert _parse_attachment_from_text("[文件] report.pdf", "群A") == ("report.pdf", "file")
+    assert _parse_attachment_from_text("[File] report.pdf", "群A") == ("report.pdf", "file")
+    raw_name = "群A\n张三: @机器人 /c 改文件\n张三: [文件] report.docx"
+    assert _parse_attachment_from_text(
+        raw_name, "群A", current_content="@机器人 /c 改文件"
+    ) == ("report.docx", "file")
+    assert _parse_attachment_from_text("[图片]", "群A") == (None, "image")
+    assert _parse_attachment_from_text("[Image]", "群A") == (None, "image")
+    assert _parse_attachment_from_text("[照片] 描述", "群A") == (None, "image")
+    assert _parse_attachment_from_text("普通文本消息", "群A") == (None, None)
+    print("✅ Attachment parse test passed")
+
+
+# ---------------------------------------------------------------------------
+# 微信下载目录监控测试
+# ---------------------------------------------------------------------------
+
+
+def test_file_monitor_resolve():
+    import tempfile
+    from src.features.messaging.file_monitor import (
+        FileMonitorConfig,
+        WeChatDownloadMonitor,
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 创建测试文件
+        test_file = os.path.join(tmpdir, "test_doc.pdf")
+        with open(test_file, "w") as f:
+            f.write("test")
+
+        cfg = FileMonitorConfig(
+            enabled=True,
+            watch_dirs=[tmpdir],
+            poll_interval=1.0,
+            max_age_seconds=600.0,
+        )
+        monitor = WeChatDownloadMonitor(cfg)
+        monitor._refresh_index()
+
+        resolved = monitor.resolve("test_doc.pdf")
+        assert resolved == test_file, f"Expected {test_file}, got {resolved}"
+
+        # 测试不存在的文件
+        assert monitor.resolve("nonexistent.txt") is None
+        print("✅ FileMonitor test passed: resolve by filename")
+
+
+def test_file_monitor_auto_discover_off():
+    import tempfile
+    from src.features.messaging.file_monitor import (
+        FileMonitorConfig,
+        WeChatDownloadMonitor,
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_file = os.path.join(tmpdir, "doc.xlsx")
+        with open(test_file, "w") as f:
+            f.write("test")
+
+        cfg = FileMonitorConfig(
+            enabled=True,
+            watch_dirs=[tmpdir],
+            auto_discover=False,
+        )
+        monitor = WeChatDownloadMonitor(cfg)
+        monitor._refresh_index()
+
+        resolved = monitor.resolve("doc.xlsx")
+        assert resolved == test_file
+        print("✅ FileMonitor test passed: custom watch_dirs only")
+
+
+# ---------------------------------------------------------------------------
+# WeChatFileDownloader 测试
+# ---------------------------------------------------------------------------
+
+
+def test_file_downloader_shortcut():
+    """file_monitor 已索引时直接短路返回，不走 UIA。"""
+    import tempfile
+    from src.features.messaging.file_monitor import FileMonitorConfig, WeChatDownloadMonitor
+    from src.features.messaging.file_downloader import WeChatFileDownloader
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_file = os.path.join(tmpdir, "shortcut.pdf")
+        with open(test_file, "w") as f:
+            f.write("test")
+
+        cfg = FileMonitorConfig(enabled=True, watch_dirs=[tmpdir], auto_discover=False)
+        monitor = WeChatDownloadMonitor(cfg)
+        monitor._refresh_index()
+
+        downloader = WeChatFileDownloader(file_monitor=monitor)
+        result = downloader.download("shortcut.pdf")
+        assert result == test_file, f"Expected {test_file}, got {result}"
+        print("✅ FileDownloader test passed: shortcut when already indexed")
+
+
+def test_file_downloader_no_monitor():
+    """无 file_monitor 且无法获取窗口时返回 None。"""
+    from src.features.messaging.file_downloader import WeChatFileDownloader
+
+    downloader = WeChatFileDownloader(file_monitor=None)
+    result = downloader.download("some_file.pdf")
+    assert result is None
+    print("✅ FileDownloader test passed: returns None without monitor/window")
+
+
+# ---------------------------------------------------------------------------
+# HybridResponder 主动下载触发测试
+# ---------------------------------------------------------------------------
+
+
+def test_hybrid_file_downloader_trigger():
+    """file_monitor 未命中时，HybridResponder 应尝试调用 file_downloader 主动下载。"""
+    from unittest.mock import MagicMock
+    from src.ai import AIResponder
+    from src.openclaw_client import HybridResponder, OpenClawConfig, OpenClawClient, OpenClawResult
+
+    ai_resp = MagicMock(spec=AIResponder)
+    ai_resp.reply_on_at = True
+
+    oc_client = MagicMock(spec=OpenClawClient)
+    oc_client.run_agent_full.return_value = OpenClawResult(
+        text="analysis done", file_paths=[]
+    )
+
+    # file_monitor 未命中
+    file_monitor = MagicMock()
+    file_monitor.resolve.return_value = None
+
+    # file_downloader 成功下载
+    file_downloader = MagicMock()
+    file_downloader.download.return_value = "/tmp/downloaded.pdf"
+
+    cfg = OpenClawConfig(enabled=True, prefixes=["/claw"], file_support=True)
+    hybrid = HybridResponder(
+        ai_resp,
+        openclaw_client=oc_client,
+        openclaw_config=cfg,
+        file_monitor=file_monitor,
+        file_downloader=file_downloader,
+    )
+
+    event = _make_event("@机器人 /claw 分析这个文件")
+    event = event.__class__(**{**event.__dict__, "attachment_name": "report.pdf"})
+
+    result = hybrid(event)
+
+    # 验证 file_downloader 被调用
+    file_downloader.download.assert_called_once_with("report.pdf")
+    # 验证 OpenClawClient 被传入下载后的路径
+    oc_client.run_agent_full.assert_called_once()
+    _, kwargs = oc_client.run_agent_full.call_args
+    assert kwargs.get("file_path") == "/tmp/downloaded.pdf"
+    assert isinstance(result, OpenClawResult)
+    print("✅ HybridResponder test passed: triggers file_downloader when monitor misses")
 
 if __name__ == "__main__":
     print("Running OpenClaw JSON parse mock tests...\n")
@@ -252,4 +624,41 @@ if __name__ == "__main__":
     test_hybrid_disabled()
     test_hybrid_session_isolation()
     print("\n🎉 All 5 HybridResponder tests passed!")
-    print("\n✅ T7 集成测试全部通过！")
+
+    print("\nRunning OpenClawResult composite tests...\n")
+    test_extract_result_full_payloads_file()
+    test_extract_result_full_top_level_file_paths()
+    test_extract_result_full_backward_compat()
+    test_parse_result_full_mixed_stderr()
+    test_scan_workspace_recent_files_excludes_input_copy()
+    test_extract_file_paths_from_text_chinese_punctuation()
+    print("\n🎉 All 6 composite result tests passed!")
+
+    print("\nRunning HybridResponder file routing tests...\n")
+    test_hybrid_returns_openclaw_result()
+    print("\n🎉 HybridResponder file routing test passed!")
+
+    print("\nRunning CallbackHandler action build tests...\n")
+    test_callback_handler_build_actions_openclaw_result()
+    test_callback_handler_build_actions_files_only()
+    print("\n🎉 All 2 CallbackHandler tests passed!")
+
+    print("\nRunning attachment parse tests...\n")
+    test_parse_attachment_from_text()
+    print("\n🎉 Attachment parse test passed!")
+
+    print("\nRunning file monitor tests...\n")
+    test_file_monitor_resolve()
+    test_file_monitor_auto_discover_off()
+    print("\n🎉 All 2 file monitor tests passed!")
+
+    print("\nRunning file downloader tests...\n")
+    test_file_downloader_shortcut()
+    test_file_downloader_no_monitor()
+    print("\n🎉 All 2 file downloader tests passed!")
+
+    print("\nRunning HybridResponder file downloader trigger tests...\n")
+    test_hybrid_file_downloader_trigger()
+    print("\n🎉 HybridResponder file downloader trigger test passed!")
+
+    print("\n✅ T7 + T9 集成测试全部通过！")

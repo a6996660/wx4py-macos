@@ -14,7 +14,9 @@ from .openclaw_client import (
     OpenClawConfig,
     OpenClawError,
     OpenClawNotFoundError,
+    OpenClawResult,
 )
+from .features.messaging.file_monitor import FileMonitorConfig, WeChatDownloadMonitor
 from .features.messaging.forwarder import (
     ForwardPayload,
     ForwardRuleHandler,
@@ -25,6 +27,7 @@ from .features.messaging.listener import MessageEvent, WeChatGroupListener
 from .features.messaging.processor import (
     AsyncCallbackHandler,
     CallbackHandler,
+    FileReplyAction,
     ForwardAction,
     MessageAction,
     MessageHandler,
@@ -48,6 +51,7 @@ __all__ = [
     "AIResponder",
     "OpenClawClient",
     "OpenClawConfig",
+    "OpenClawResult",
     "HybridResponder",
     "OpenClawError",
     "OpenClawNotFoundError",
@@ -56,10 +60,13 @@ __all__ = [
     "MessageAction",
     "ReplyAction",
     "ForwardAction",
+    "FileReplyAction",
     "MessageHandler",
     "CallbackHandler",
     "AsyncCallbackHandler",
     "WeChatGroupProcessor",
+    "FileMonitorConfig",
+    "WeChatDownloadMonitor",
     "ForwardTarget",
     "ForwardPayload",
     "GroupForwardRule",

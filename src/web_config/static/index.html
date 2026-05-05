@@ -232,8 +232,63 @@ input.error+.error-text,.form-group:has(input.error) .error-text{display:block}
           <input type="text" id="ocCliPath" />
           <p class="hint">留空表示从 PATH 自动查找 openclaw</p>
         </div>
+        <div class="form-group">
+          <label>重置指令</label>
+          <div class="tag-input" id="ocResetCommandsInput"><input placeholder="输入指令后按回车添加，如 /new" /></div>
+          <p class="hint">发送这些指令会清空当前群聊的 OpenClaw 上下文 session</p>
+        </div>
+        <div class="form-group">
+          <label>重置回复文本</label>
+          <input type="text" id="ocResetReply" />
+          <p class="hint">重置成功后的回复内容</p>
+        </div>
+        <label class="checkbox">
+          <input type="checkbox" id="ocFileSupport" />
+          <span>启用文件传递支持</span>
+        </label>
+        <p class="hint">开启后，OpenClaw agent 可接收本地文件路径参数（需 CLI 支持 --file）</p>
+      </div>
+
+      <!-- 文件处理（合并到 OpenClaw 页签） -->
+      <div class="card">
+        <div class="section-title">文件发现与下载</div>
+        <label class="checkbox">
+          <input type="checkbox" id="fmEnabled" />
+          <span>启用文件发现与主动下载</span>
+        </label>
+        <p class="hint">启用后，自动监控微信下载目录并索引已接收的文件；当 @ 消息引用未下载的文件时，自动触发 UIA 点击下载，完成后将文件路径传递给 OpenClaw 处理</p>
+      </div>
+      <div class="card" id="fmBody">
+        <div class="section-title">监控参数</div>
+        <div class="form-group">
+          <label>自定义监控目录</label>
+          <div class="tag-input" id="fmWatchDirsInput"><input placeholder="输入目录路径后按回车添加" /></div>
+          <p class="hint">留空则自动发现微信数据目录；如有特殊路径可手动添加</p>
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label>轮询间隔（秒）</label>
+            <input type="number" id="fmPollInterval" min="1" step="1" />
+          </div>
+          <div class="form-group">
+            <label>文件最大有效期（秒）</label>
+            <input type="number" id="fmMaxAge" min="10" step="1" />
+            <p class="hint">超过此时长的文件不再纳入索引</p>
+          </div>
+        </div>
+        <label class="checkbox">
+          <input type="checkbox" id="fmAutoDiscover" />
+          <span>自动发现微信目录</span>
+        </label>
+        <div class="form-group" style="margin-top:14px;padding:10px 14px;background:#f0fdf4;border-radius:8px;border:1px solid #bbf7d0;">
+          <p style="font-size:.8rem;color:#166534;margin:0;line-height:1.5;">
+            <strong>主动下载说明</strong><br/>
+            当消息引用的是未下载的文件时，系统会自动点击引用气泡弹出下载窗口并接收文件。此功能依赖 macOS 辅助功能权限和微信前台窗口。
+          </p>
+        </div>
       </div>
     </div>
+
   </form>
 
   <div class="footer-actions">
@@ -293,6 +348,8 @@ function createTagInput(el, values) {
 }
 const groupsTags = createTagInput(document.getElementById('groupsInput'), []);
 const ocPrefixesTags = createTagInput(document.getElementById('ocPrefixesInput'), []);
+const ocResetCommandsTags = createTagInput(document.getElementById('ocResetCommandsInput'), []);
+const fmWatchDirsTags = createTagInput(document.getElementById('fmWatchDirsInput'), []);
 
 /* ---------- Providers ---------- */
 let providerCounter = 0;
@@ -396,9 +453,20 @@ function loadConfig(cfg) {
   document.getElementById('ocSessionPerGroup').checked = oc.session_per_group !== false;
   document.getElementById('ocPlaceholder').value = oc.placeholder_text ?? '让我想想…';
   document.getElementById('ocPlaceholderFail').value = oc.placeholder_reply_on_failure ?? '这个我直接来答吧';
+  ocResetCommandsTags.set(Array.isArray(oc.reset_commands) ? oc.reset_commands : ['/new','/reset']);
+  document.getElementById('ocResetReply').value = oc.reset_reply ?? '🆕 已重置对话，开始新会话～';
   const cliPathVal = oc.cli_path ?? '';
   document.getElementById('ocCliPath').value = cliPathVal;
+  document.getElementById('ocFileSupport').checked = !!oc.file_support;
   toggleOcBody();
+
+  const fm = cfg.file_monitor || {};
+  document.getElementById('fmEnabled').checked = !!fm.enabled;
+  fmWatchDirsTags.set(Array.isArray(fm.watch_dirs) ? fm.watch_dirs : []);
+  document.getElementById('fmPollInterval').value = fm.poll_interval ?? 5;
+  document.getElementById('fmMaxAge').value = fm.max_age_seconds ?? 600;
+  document.getElementById('fmAutoDiscover').checked = fm.auto_discover !== false;
+  toggleFmBody();
 }
 
 function collectConfig() {
@@ -428,6 +496,18 @@ function collectConfig() {
     placeholder_text: document.getElementById('ocPlaceholder').value.trim() || '让我想想…',
     placeholder_reply_on_failure: document.getElementById('ocPlaceholderFail').value.trim() || '这个我直接来答吧',
     cli_path: document.getElementById('ocCliPath').value.trim(),
+    reset_commands: ocResetCommandsTags.get(),
+    reset_reply: document.getElementById('ocResetReply').value.trim() || '🆕 已重置对话，开始新会话～',
+    file_support: document.getElementById('ocFileSupport').checked,
+  };
+
+  const fmEnabled = document.getElementById('fmEnabled').checked;
+  const file_monitor = {
+    enabled: fmEnabled,
+    watch_dirs: fmWatchDirsTags.get(),
+    poll_interval: parseFloat(document.getElementById('fmPollInterval').value) || 5,
+    max_age_seconds: parseFloat(document.getElementById('fmMaxAge').value) || 600,
+    auto_discover: document.getElementById('fmAutoDiscover').checked,
   };
 
   function safeFloat(v) { const n = parseFloat(v); return isNaN(n) ? v : n; }
@@ -446,6 +526,7 @@ function collectConfig() {
     default: document.getElementById('defaultProvider').value.trim(),
     providers,
     openclaw: oc,
+    file_monitor: file_monitor,
   };
 }
 
@@ -456,6 +537,13 @@ function toggleOcBody() {
   document.getElementById('ocBody').style.pointerEvents = on ? 'auto' : 'none';
 }
 document.getElementById('ocEnabled').addEventListener('change', toggleOcBody);
+
+function toggleFmBody() {
+  const on = document.getElementById('fmEnabled').checked;
+  document.getElementById('fmBody').style.opacity = on ? '1' : '0.5';
+  document.getElementById('fmBody').style.pointerEvents = on ? 'auto' : 'none';
+}
+document.getElementById('fmEnabled').addEventListener('change', toggleFmBody);
 
 function showToast(msg, type) {
   const t = document.getElementById('toast');

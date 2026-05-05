@@ -43,6 +43,21 @@
     "session_per_group": true,
     "placeholder_text": "让我想想…",
     "placeholder_reply_on_failure": "这个我直接来答吧",
-    "cli_path": "/Users/xxx/.nvm/versions/node/v22.22.1/bin/openclaw"
+    "cli_path": "/Users/xxx/.nvm/versions/node/v22.22.1/bin/openclaw",
+    "file_support": false,
+    "reset_commands": ["/new", "/reset"],
+    "_reset_commands_说明": "触发会话重置的指令列表。发送这些指令会清空当前群聊的 OpenClaw 上下文 session。",
+    "reset_reply": "🆕 已重置对话，开始新会话～",
+    "_reset_reply_说明": "重置成功后的回复文本，可自定义为其他提示语。",
+    "session_map": {},
+    "_session_map_说明": "群聊与 OpenClaw session ID 的对照表。首次自动根据群名生成，发送 /new 后会更新。请勿手动修改。"
+  },
+  "file_monitor": {
+    "_说明": "微信下载目录文件监控。启用后可自动发现微信群聊中接收的文件实际路径，传递给 OpenClaw 处理。",
+    "enabled": false,
+    "watch_dirs": [],
+    "poll_interval": 5,
+    "max_age_seconds": 600,
+    "auto_discover": true
   }
 }

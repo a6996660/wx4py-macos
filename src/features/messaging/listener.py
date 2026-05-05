@@ -62,6 +62,8 @@ class MessageEvent:
     raw: object = None
     quoted_content: Optional[str] = None
     quoted_sender: Optional[str] = None
+    attachment_name: Optional[str] = None
+    attachment_type: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -701,6 +703,99 @@ def _extract_message_from_session_item(control, group_name: str) -> Optional[str
     return None
 
 
+# 常见文件扩展名白名单（用于微信预览省略 [文件] 标记时的 fallback 识别）
+_FILE_EXT_PATTERN = re.compile(
+    r"\.([a-zA-Z0-9]{2,6})(?:\s|$|[,;)\]}])"
+)
+_FILE_EXT_WHITELIST = {
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+    "zip", "rar", "7z", "tar", "gz", "bz2",
+    "txt", "csv", "md", "json", "xml", "yaml", "yml",
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "svg",
+    "mp4", "mov", "avi", "mkv", "flv",
+    "mp3", "wav", "aac", "flac", "ogg",
+    "exe", "dmg", "pkg", "deb", "rpm",
+}
+
+
+def _parse_attachment_from_text(
+    text: str, group_name: str, current_content: Optional[str] = None
+) -> Tuple[Optional[str], Optional[str]]:
+    """从会话预览文本中解析附件信息。
+
+    注意：微信会话列表项的 Name 属性可能包含历史消息（如旧文件预览 + 新文本消息）。
+    为避免历史消息污染，优先只检查与 current_content 相邻的行。
+
+    Returns:
+        (attachment_name, attachment_type)
+        attachment_type 取值: "file" | "image" | None
+    """
+    if not text:
+        return None, None
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    # 过滤掉元数据行，保留候选消息行
+    candidate_lines = [
+        line for line in lines
+        if line != group_name
+        and line not in {"消息免打扰"}
+        and not re.match(r"^\d{1,2}:\d{2}$", line)
+        and line not in {"已发送", "已接收", "Sent", "Received", "撤回了一条消息"}
+    ]
+
+    if not candidate_lines:
+        return None, None
+
+    # 确定需要检查的行索引
+    check_indices: List[int] = []
+    if current_content:
+        # 在 candidate_lines 中找到 current_content 所在的位置
+        content_idx = -1
+        for i, line in enumerate(candidate_lines):
+            if current_content in line or line in current_content:
+                content_idx = i
+                break
+        if content_idx >= 0:
+            # 只检查 current_content 所在行及其前一行（附件通常在消息之前）
+            if content_idx > 0:
+                check_indices.append(content_idx - 1)
+            check_indices.append(content_idx)
+        else:
+            # 没找到 current_content，回退到只检查最后一条候选行
+            check_indices.append(len(candidate_lines) - 1)
+    else:
+        # 没有 current_content，回退到只检查最后一条候选行
+        check_indices.append(len(candidate_lines) - 1)
+
+    for idx in check_indices:
+        check_line = candidate_lines[idx]
+        # 跳过包含 @ 的消息正文行
+        if "@" in check_line:
+            continue
+
+        # 去掉可能的发送者前缀，如 "丁某某: [文件] xxx"
+        content = check_line
+        if ":" in content:
+            content = content.split(":", 1)[1].strip()
+        elif "：" in content:
+            content = content.split("：", 1)[1].strip()
+        content = re.sub(r"^\[[^\]]+\]\s*", "", content).strip()
+
+        # 策略 1: 匹配 [文件] filename 或 [File] filename
+        m = re.match(r"^\[(?:文件|File)\]\s*(.+)$", content)
+        if m:
+            return m.group(1).strip(), "file"
+        if re.match(r"^\[(?:图片|Image|照片|Photo)\]", content):
+            return None, "image"
+
+        # 策略 2: fallback — 微信预览可能省略 [文件] 标记，直接显示文件名
+        m = _FILE_EXT_PATTERN.search(content)
+        if m and m.group(1).lower() in _FILE_EXT_WHITELIST:
+            return content, "file"
+
+    return None, None
+
+
 def _click_control(control) -> bool:
     try:
         control.Click()
@@ -924,6 +1019,19 @@ class WeChatGroupListener:
 
             # 记录原始 UIA Name，帮助验证引用消息实际格式
             raw_name = _safe_text(session_item, "Name")
+            logger.info(
+                "诊断-左侧会话原始Name: group=%s, raw_name=%r",
+                session.group,
+                raw_name,
+            )
+            attachment_name, attachment_type = _parse_attachment_from_text(
+                raw_name, session.group, current_content=content
+            )
+            if attachment_name or attachment_type:
+                logger.info(
+                    "附件识别: group=%s, name=%r, type=%r",
+                    session.group, attachment_name, attachment_type,
+                )
             logger.debug(
                 "引用调试: group=%s, raw_name=%r, extracted_content=%r",
                 session.group, raw_name, content,
@@ -935,6 +1043,17 @@ class WeChatGroupListener:
                     "引用解析成功: group=%s, quoted_sender=%r, quoted_content=%r, clean=%r",
                     session.group, quoted_sender, quoted_content, clean_content,
                 )
+            logger.info(
+                "诊断-当前解析字段: group=%s, sender=%r, content=%r, clean=%r, quoted_sender=%r, quoted_content=%r, attachment_name=%r, attachment_type=%r",
+                session.group,
+                sender_nickname,
+                content,
+                clean_content,
+                quoted_sender,
+                quoted_content,
+                attachment_name,
+                attachment_type,
+            )
 
             # 左侧预览未包含引用内容时，尝试从聊天窗口消息气泡读取
             if not quoted_content:
@@ -950,6 +1069,56 @@ class WeChatGroupListener:
                         "从聊天气泡获取引用: group=%s, quoted_sender=%r, quoted_content=%r",
                         session.group, quoted_sender, quoted_content,
                     )
+
+            # 如果引用内容中包含文件/图片，提取附件信息（REQ-002）
+            if quoted_content and not attachment_name:
+                q_lines = [
+                    line.strip()
+                    for line in quoted_content.splitlines()
+                    if line.strip()
+                ]
+                for q_line in q_lines:
+                    # 策略 A: 匹配 [文件] filename / [File] filename
+                    m = re.match(r"^\[(?:文件|File)\]\s*(.+)$", q_line)
+                    if m:
+                        attachment_name = m.group(1).strip()
+                        attachment_type = "file"
+                        logger.info(
+                            "引用内容识别为文件: group=%s, name=%r",
+                            session.group, attachment_name,
+                        )
+                        break
+                    # 策略 B: 匹配 [图片] / [Image] / [照片] / [Photo]
+                    if re.match(r"^\[(?:图片|Image|照片|Photo)\]", q_line):
+                        attachment_type = "image"
+                        logger.info(
+                            "引用内容识别为图片: group=%s", session.group
+                        )
+                        break
+                    # 策略 C: fallback — 引用内容直接是文件名（微信气泡省略 [文件] 标记）
+                    m_ext = _FILE_EXT_PATTERN.search(q_line)
+                    if m_ext and m_ext.group(1).lower() in _FILE_EXT_WHITELIST:
+                        attachment_name = q_line
+                        attachment_type = "file"
+                        logger.info(
+                            "引用内容识别为文件(fallback): group=%s, name=%r",
+                            session.group, attachment_name,
+                        )
+                        break
+
+            # 兜底校验：如果从 raw_name 解析出了附件，但当前消息不是引用消息
+            # 且消息正文中没有明确提到文件/附件，则认为是历史消息污染，清空附件
+            if attachment_name and not quoted_content:
+                has_file_hint = bool(
+                    re.search(r"\[文件\]|\[File\]|附件|文件", clean_content, re.IGNORECASE)
+                )
+                if not has_file_hint:
+                    logger.info(
+                        "忽略疑似历史消息附件: group=%s, attachment=%r, clean=%r",
+                        session.group, attachment_name, clean_content,
+                    )
+                    attachment_name = None
+                    attachment_type = None
 
             normalized_text = _normalize_message_text(clean_content)
             if normalized_text:
@@ -967,6 +1136,8 @@ class WeChatGroupListener:
                 at_hint=True,
                 quoted_sender=quoted_sender,
                 quoted_content=quoted_content,
+                attachment_name=attachment_name,
+                attachment_type=attachment_type,
             )
             session.at_hint_pending = False
             session.at_hint_sender = None
@@ -1034,6 +1205,19 @@ class WeChatGroupListener:
                 return None, None
 
             logger.debug("获取引用: 消息列表共 %d 条 group=%s", len(children), session.group)
+            diag_items = []
+            for idx, child in enumerate(reversed(children[-10:]), 1):
+                cls = _safe_text(child, "ClassName")
+                auto_id = _safe_text(child, "AutomationId")
+                name = _safe_text(child, "Name")
+                diag_items.append(
+                    f"#{idx} class={cls!r} auto_id={auto_id!r} name={name!r}"
+                )
+            logger.info(
+                "诊断-右侧最近气泡原始Name: group=%s, items=[%s]",
+                session.group,
+                "; ".join(diag_items),
+            )
 
             # 辅助函数：从单个子控件解析引用
             def _try_parse_child(child) -> Tuple[Optional[str], Optional[str]]:
@@ -1169,6 +1353,8 @@ class WeChatGroupListener:
         sender_nickname: Optional[str] = None,
         quoted_sender: Optional[str] = None,
         quoted_content: Optional[str] = None,
+        attachment_name: Optional[str] = None,
+        attachment_type: Optional[str] = None,
     ) -> None:
         event = MessageEvent(
             group=session.group,
@@ -1182,6 +1368,8 @@ class WeChatGroupListener:
             raw=None,
             quoted_sender=quoted_sender,
             quoted_content=quoted_content,
+            attachment_name=attachment_name,
+            attachment_type=attachment_type,
         )
         try:
             reply = self.on_message(event)
@@ -1200,6 +1388,9 @@ class WeChatGroupListener:
         sender_nickname: Optional[str] = None,
     ) -> None:
         quoted_sender, quoted_content, clean_content = _parse_quote_from_text(item.name)
+        attachment_name, attachment_type = _parse_attachment_from_text(
+            item.name, session.group, current_content=clean_content
+        )
         event = MessageEvent(
             group=session.group,
             content=clean_content,
@@ -1212,6 +1403,8 @@ class WeChatGroupListener:
             raw=item.control,
             quoted_sender=quoted_sender,
             quoted_content=quoted_content,
+            attachment_name=attachment_name,
+            attachment_type=attachment_type,
         )
         try:
             reply = self.on_message(event)

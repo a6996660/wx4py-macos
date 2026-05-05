@@ -35,6 +35,10 @@ from src import (
     OpenClawConfig,
     WeChatClient,
 )
+from src.features.messaging.file_monitor import (
+    FileMonitorConfig,
+    WeChatDownloadMonitor,
+)
 
 
 DEFAULT_CONFIG_FILE = "wx4py_ai_config.json"
@@ -172,6 +176,11 @@ def _load_openclaw_config(config: Dict[str, Any]) -> OpenClawConfig:
     return OpenClawConfig.from_dict(config.get("openclaw"))
 
 
+def _load_file_monitor_config(config: Dict[str, Any]) -> FileMonitorConfig:
+    """读取文件监控配置节，缺失时返回默认禁用状态。"""
+    return FileMonitorConfig.from_dict(config.get("file_monitor"))
+
+
 def _lock_path(config_file: Path) -> Path:
     """锁文件放在配置文件同目录，便于多项目并行时相互隔离。"""
     return config_file.parent / DEFAULT_LOCK_FILE
@@ -236,11 +245,27 @@ def main() -> None:
                         reply_on_at=True,
                         max_reply_chars=ai_max_reply_chars,
                     )
+                    # 文件监控（可选）
+                    file_monitor_cfg = _load_file_monitor_config(raw_config)
+                    file_monitor: Optional[WeChatDownloadMonitor] = None
+                    if file_monitor_cfg.enabled:
+                        file_monitor = WeChatDownloadMonitor(file_monitor_cfg)
+                        file_monitor.start()
+
+                    # 文件下载器（可选，依赖文件监控）
+                    file_downloader = None
+                    if file_monitor is not None:
+                        from src.features.messaging import WeChatFileDownloader
+                        file_downloader = WeChatFileDownloader(file_monitor)
+
                     if openclaw_cfg.enabled:
                         responder = HybridResponder(
                             ai_responder,
                             openclaw_client=OpenClawClient(openclaw_cfg),
                             openclaw_config=openclaw_cfg,
+                            file_monitor=file_monitor,
+                            file_downloader=file_downloader,
+                            config_path=config_file,
                         )
                     else:
                         responder = ai_responder

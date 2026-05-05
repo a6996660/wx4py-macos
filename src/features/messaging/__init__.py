@@ -7,6 +7,7 @@ from .forwarder import (
     ForwardTarget,
     GroupForwardRule,
 )
+from .file_downloader import WeChatFileDownloader
 from .listener import MessageEvent, WeChatGroupListener
 from .processor import (
     AsyncCallbackHandler,
@@ -21,6 +22,7 @@ from .processor import (
 __all__ = [
     "MessageEvent",
     "WeChatGroupListener",
+    "WeChatFileDownloader",
     "MessageAction",
     "ReplyAction",
     "ForwardAction",

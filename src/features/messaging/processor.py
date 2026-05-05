@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -52,6 +53,16 @@ class ForwardAction(MessageAction):
     target_type: str
     content: str
     source_group: str
+
+
+@dataclass(frozen=True)
+class FileReplyAction(MessageAction):
+    """向群聊发送文件。"""
+
+    group: str
+    file_path: str
+    message: Optional[str] = None
+    group_nickname: str = ""
 
 
 class MessageHandler:
@@ -97,6 +108,46 @@ class CallbackHandler(MessageHandler):
             return result
         if isinstance(result, (list, tuple)):
             return list(result)
+
+        from ...openclaw_client import OpenClawResult
+        if isinstance(result, OpenClawResult):
+            actions: List[MessageAction] = []
+            text = (result.text or "").strip()
+            if text:
+                if not self.auto_reply:
+                    pass
+                elif self.reply_on_at and not event.is_at_me:
+                    pass
+                elif self.reply_on_at and not (event.sender_nickname or "").strip():
+                    logger.warning(
+                        "跳过自动回复：未解析到 @ 发送人，group=%s", event.group
+                    )
+                    self._audit_event(
+                        event, "skipped", reason="missing_sender_before_reply"
+                    )
+                else:
+                    if self.reply_on_at:
+                        text = self._prefix_sender_mention(event, text)
+                    self._audit_event(event, "reply_generated", reply=text)
+                    actions.append(
+                        ReplyAction(
+                            group=event.group,
+                            content=text,
+                            sender_nickname=event.sender_nickname or "",
+                            original_content=event.content or "",
+                            group_nickname=event.group_nickname or "",
+                        )
+                    )
+            for fp in (result.file_paths or []):
+                if isinstance(fp, str) and fp.strip():
+                    actions.append(
+                        FileReplyAction(
+                            group=event.group,
+                            file_path=fp.strip(),
+                        )
+                    )
+            return actions if actions else None
+
         if not self.auto_reply:
             return None
 
@@ -255,6 +306,8 @@ class AsyncCallbackHandler(CallbackHandler):
             raw=None,
             quoted_sender=getattr(event, "quoted_sender", None),
             quoted_content=getattr(event, "quoted_content", None),
+            attachment_name=getattr(event, "attachment_name", None),
+            attachment_type=getattr(event, "attachment_type", None),
         )
 
     def stop(self) -> None:
@@ -450,6 +503,9 @@ class WeChatGroupProcessor:
         if isinstance(action, ForwardAction):
             self._execute_forward(action)
             return
+        if isinstance(action, FileReplyAction):
+            self._execute_file_reply(action)
+            return
         logger.warning(f"忽略未知动作类型: {type(action).__name__}")
 
     def _execute_reply(self, action: ReplyAction) -> None:
@@ -501,6 +557,59 @@ class WeChatGroupProcessor:
             return
 
         logger.info(f"[{action.source_group} -> {action.target_name}] 已转发")
+
+    def _execute_file_reply(self, action: FileReplyAction) -> None:
+        fp = action.file_path or ""
+        if not fp or not os.path.isfile(fp):
+            logger.warning("文件回复失败: 文件不存在 %s", fp)
+            return
+
+        sent = False
+        # 优先复用当前群聊窗口（和文字回复走同样的复用逻辑，避免重新搜索群名）
+        if self._listener is not None:
+            try:
+                current_group, current_group_at, _, _ = self._listener._get_send_state()
+                if (
+                    current_group == action.group
+                    and time.time() - current_group_at <= 180
+                ):
+                    sent = self.client.chat_window.send_file(
+                        fp, message=action.message
+                    )
+                    if sent:
+                        logger.info(
+                            "复用当前群窗口发送文件: group=%s, file=%s",
+                            action.group, fp,
+                        )
+            except Exception as exc:
+                logger.debug("复用窗口发送文件尝试失败: %s", exc)
+
+        if not sent:
+            # fallback：重新打开聊天窗口发送
+            sent = self.client.chat_window.send_file_to(
+                action.group, fp, target_type="group", message=action.message
+            )
+
+        try:
+            log_group_mention_audit(
+                action.group,
+                {
+                    "event": "file_sent" if sent else "file_send_failed",
+                    "file_path": fp,
+                    "context_key": f"{action.group}|{action.group_nickname}",
+                },
+            )
+        except Exception as exc:
+            logger.debug("写入文件发送审计日志失败: %s", exc)
+        if not sent:
+            log_error_audit(
+                "file_reply_failed",
+                {
+                    "group": action.group,
+                    "file_path": fp,
+                    "context_key": f"{action.group}|{action.group_nickname}",
+                },
+            )
 
     def _record_group_send(self, action: ForwardAction) -> None:
         if not self._listener:

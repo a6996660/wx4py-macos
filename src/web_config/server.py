@@ -38,6 +38,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "placeholder_text": "让我想想…",
         "placeholder_reply_on_failure": "这个我直接来答吧",
         "cli_path": "",
+        "file_support": False,
+        "reset_commands": ["/new", "/reset"],
+        "reset_reply": "🆕 已重置对话，开始新会话～",
+        "session_map": {},
+    },
+    "file_monitor": {
+        "enabled": False,
+        "watch_dirs": [],
+        "poll_interval": 5,
+        "max_age_seconds": 600,
+        "auto_discover": True,
     },
 }
 
