@@ -767,10 +767,30 @@ def _parse_attachment_from_text(
         # 没有 current_content，回退到只检查最后一条候选行
         check_indices.append(len(candidate_lines) - 1)
 
+    logger.info(
+        "诊断-附件解析候选: group=%s, current_content=%r, candidate_lines=%r, check_indices=%r",
+        group_name,
+        current_content,
+        candidate_lines,
+        check_indices,
+    )
+
     for idx in check_indices:
         check_line = candidate_lines[idx]
+        logger.info(
+            "诊断-附件检查行: group=%s, idx=%s, line=%r",
+            group_name,
+            idx,
+            check_line,
+        )
         # 跳过包含 @ 的消息正文行
         if "@" in check_line:
+            logger.info(
+                "诊断-附件检查跳过@行: group=%s, idx=%s, line=%r",
+                group_name,
+                idx,
+                check_line,
+            )
             continue
 
         # 去掉可能的发送者前缀，如 "丁某某: [文件] xxx"
@@ -784,15 +804,40 @@ def _parse_attachment_from_text(
         # 策略 1: 匹配 [文件] filename 或 [File] filename
         m = re.match(r"^\[(?:文件|File)\]\s*(.+)$", content)
         if m:
+            logger.info(
+                "诊断-附件命中显式文件: group=%s, idx=%s, filename=%r, raw_line=%r",
+                group_name,
+                idx,
+                m.group(1).strip(),
+                check_line,
+            )
             return m.group(1).strip(), "file"
         if re.match(r"^\[(?:图片|Image|照片|Photo)\]", content):
+            logger.info(
+                "诊断-附件命中图片: group=%s, idx=%s, raw_line=%r",
+                group_name,
+                idx,
+                check_line,
+            )
             return None, "image"
 
         # 策略 2: fallback — 微信预览可能省略 [文件] 标记，直接显示文件名
         m = _FILE_EXT_PATTERN.search(content)
         if m and m.group(1).lower() in _FILE_EXT_WHITELIST:
+            logger.info(
+                "诊断-附件命中文件名fallback: group=%s, idx=%s, filename=%r, raw_line=%r",
+                group_name,
+                idx,
+                content,
+                check_line,
+            )
             return content, "file"
 
+    logger.info(
+        "诊断-附件解析无命中: group=%s, current_content=%r",
+        group_name,
+        current_content,
+    )
     return None, None
 
 
@@ -1069,6 +1114,15 @@ class WeChatGroupListener:
                         "从聊天气泡获取引用: group=%s, quoted_sender=%r, quoted_content=%r",
                         session.group, quoted_sender, quoted_content,
                     )
+                    logger.info(
+                        "诊断-气泡引用后字段: group=%s, clean=%r, quoted_sender=%r, quoted_content=%r, attachment_name=%r, attachment_type=%r",
+                        session.group,
+                        clean_content,
+                        quoted_sender,
+                        quoted_content,
+                        attachment_name,
+                        attachment_type,
+                    )
 
             # 如果引用内容中包含文件/图片，提取附件信息（REQ-002）
             if quoted_content and not attachment_name:
@@ -1112,6 +1166,14 @@ class WeChatGroupListener:
                 has_file_hint = bool(
                     re.search(r"\[文件\]|\[File\]|附件|文件", clean_content, re.IGNORECASE)
                 )
+                logger.info(
+                    "诊断-附件清理判断: group=%s, attachment=%r, quoted_content=%r, clean=%r, has_file_hint=%s",
+                    session.group,
+                    attachment_name,
+                    quoted_content,
+                    clean_content,
+                    has_file_hint,
+                )
                 if not has_file_hint:
                     logger.info(
                         "忽略疑似历史消息附件: group=%s, attachment=%r, clean=%r",
@@ -1119,6 +1181,30 @@ class WeChatGroupListener:
                     )
                     attachment_name = None
                     attachment_type = None
+            elif attachment_name and quoted_content:
+                logger.info(
+                    "诊断-附件未清理原因: group=%s, attachment=%r, quoted_content_present=True, quoted_content=%r",
+                    session.group,
+                    attachment_name,
+                    quoted_content,
+                )
+            elif not attachment_name:
+                logger.info(
+                    "诊断-附件清理跳过: group=%s, reason=no_attachment, clean=%r",
+                    session.group,
+                    clean_content,
+                )
+
+            logger.info(
+                "诊断-最终事件字段: group=%s, sender=%r, clean=%r, quoted_sender=%r, quoted_content=%r, attachment_name=%r, attachment_type=%r",
+                session.group,
+                sender_nickname,
+                clean_content,
+                quoted_sender,
+                quoted_content,
+                attachment_name,
+                attachment_type,
+            )
 
             normalized_text = _normalize_message_text(clean_content)
             if normalized_text:
@@ -1244,24 +1330,47 @@ class WeChatGroupListener:
                     return result
                 return None, None
 
-            # 第一轮：优先匹配发送者和内容都对应的气泡
-            if sender_nickname and clean_content:
+            # 第一轮：优先匹配当前消息内容对应的气泡。
+            # macOS 微信右侧消息气泡 Name 经常不包含群成员昵称，只包含 "@机器人 ... 引用 ..."。
+            # sender_nickname 只能作为增强信息，不能作为硬条件。
+            if clean_content:
+                normalized_clean = _normalize_message_text(clean_content)
                 for child in reversed(children[-10:]):
                     name = _safe_text(child, "Name")
-                    if sender_nickname in name and clean_content in name:
+                    normalized_name = _normalize_message_text(name)
+                    if normalized_clean in normalized_name:
                         logger.debug(
                             "获取引用: 匹配到目标气泡 sender=%r content=%.40r group=%s",
                             sender_nickname, clean_content, session.group,
                         )
                         result = _try_parse_child(child)
                         if result[1]:
+                            logger.info(
+                                "诊断-引用气泡命中: group=%s, source=matched_current_message, sender=%r, sender_in_bubble=%s, clean=%r, bubble_name=%r, quoted=%r",
+                                session.group,
+                                sender_nickname,
+                                bool(sender_nickname and sender_nickname in name),
+                                clean_content,
+                                name,
+                                result,
+                            )
                             return result
 
-            # 第二轮：fallback 到最新一条文本/气泡消息
+            # 第二轮：只诊断最近引用气泡，不再返回。
+            # 直接返回最近任意引用会把上一条文件引用污染到“很好/不错”等纯文本消息。
             for child in reversed(children[-10:]):
+                name = _safe_text(child, "Name")
                 result = _try_parse_child(child)
                 if result[1]:
-                    return result
+                    logger.info(
+                        "诊断-引用气泡忽略: group=%s, source=fallback_recent_any, sender=%r, clean=%r, bubble_name=%r, quoted=%r",
+                        session.group,
+                        sender_nickname,
+                        clean_content,
+                        name,
+                        result,
+                    )
+                    break
 
             logger.debug("获取引用: 遍历 %d 条消息未找到引用内容 group=%s", min(len(children), 10), session.group)
             return None, None

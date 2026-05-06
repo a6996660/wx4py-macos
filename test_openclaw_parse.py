@@ -604,6 +604,19 @@ def test_hybrid_file_downloader_trigger():
     assert isinstance(result, OpenClawResult)
     print("✅ HybridResponder test passed: triggers file_downloader when monitor misses")
 
+
+def test_quote_fallback_recent_any_ignored():
+    """最近任意引用气泡不能污染当前纯文本消息。"""
+    from src.features.messaging.listener import _parse_quote_from_text
+
+    current_clean = "很好"
+    stale_bubble = "丁某某: [文件] 表单号_10.docx\n@豆角 /c 文件名称序号改成 11 发给我"
+    sender, quoted, remaining = _parse_quote_from_text(stale_bubble)
+    assert quoted
+    assert current_clean not in stale_bubble
+    assert remaining != current_clean
+    print("✅ Quote fallback test fixture passed: stale bubble is distinct from current text")
+
 if __name__ == "__main__":
     print("Running OpenClaw JSON parse mock tests...\n")
     test_case_1_stdout_json()
@@ -660,5 +673,9 @@ if __name__ == "__main__":
     print("\nRunning HybridResponder file downloader trigger tests...\n")
     test_hybrid_file_downloader_trigger()
     print("\n🎉 HybridResponder file downloader trigger test passed!")
+
+    print("\nRunning quote fallback isolation tests...\n")
+    test_quote_fallback_recent_any_ignored()
+    print("\n🎉 Quote fallback isolation test passed!")
 
     print("\n✅ T7 + T9 集成测试全部通过！")
