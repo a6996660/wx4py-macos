@@ -61,6 +61,12 @@
 
 这些日志既方便排查，也会用于启动时恢复同群上下文。
 
+### 5. 启动时自动打开配置页面
+
+运行 `python3 run_ai_group_bot.py` 后，wx4py 会先在本机启动一个只绑定 `127.0.0.1` 的临时配置页面，并自动打开浏览器。
+
+你可以直接在页面里配置监听群、回复延迟、引擎模式、AI 参数、日志路径、OpenClaw 等选项。点击“保存并启动”后，程序会写入 `wx4py_ai_config.json` 并继续启动机器人；不想手写 JSON 的用户也能快速接入。
+
 ## 存在的不足
 
 wx4py 基于 macOS Accessibility 操作微信原生客户端，优势是接入轻、无需改微信；代价是它必须依赖当前微信窗口状态。
@@ -103,15 +109,25 @@ print("wx4py ok")
 PY
 ```
 
-### 2. 复制配置模板
+### 2. 启动配置页面
+
+```bash
+python3 run_ai_group_bot.py
+```
+
+启动脚本会自动打开本地 Web 配置页面。你可以在页面中完成基础设置、AI 模型、OpenClaw 等配置，然后点击“保存并启动”进入监听状态。
+
+配置页面只运行在本机 `127.0.0.1`，并带有临时 Token 校验；保存后会生成或更新 `wx4py_ai_config.json`。
+
+### 3. 可选：手动复制配置模板
+
+如果你更习惯直接编辑 JSON，也可以复制模板后手动修改：
 
 ```bash
 cp wx4py_ai_config.example.json wx4py_ai_config.json
 ```
 
 `wx4py_ai_config.json` 已在 `.gitignore` 中，不会提交你的 API Key。
-
-### 3. 编辑配置
 
 最小配置只需要关注这些字段：
 
@@ -144,8 +160,6 @@ cp wx4py_ai_config.example.json wx4py_ai_config.json
 - `ai_max_reply_chars`：单条回复目标长度，建议控制在 80-220。
 - `default`：默认使用 `providers` 中的哪一个服务。
 - `providers`：OpenAI-compatible 模型服务配置。
-
-也可以直接运行启动脚本，它会打开本地 Web 配置界面，保存后再启动机器人。
 
 ### 4. 启动机器人
 
