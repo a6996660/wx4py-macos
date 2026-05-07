@@ -184,6 +184,32 @@ def test_hybrid_no_prefix_llm():
     print("✅ Hybrid test passed: no prefix routes to LLM")
 
 
+def test_openclaw_only_no_prefix_routes_to_openclaw():
+    """仅 OpenClaw 模式不需要前缀，所有消息都调用 OpenClaw"""
+    ai_resp = MagicMock(spec=AIResponder)
+    ai_resp.reply_on_at = True
+    ai_resp.return_value = "LLM reply"
+
+    oc_client = MagicMock(spec=OpenClawClient)
+    oc_client.run_agent_full.return_value = OpenClawResult(
+        text="OpenClaw only reply", file_paths=[]
+    )
+
+    cfg = OpenClawConfig(mode="openclaw", prefixes=["/claw"])
+    hybrid = HybridResponder(ai_resp, openclaw_client=oc_client, openclaw_config=cfg)
+
+    event = _make_event("@机器人 你好")
+    result = hybrid(event)
+
+    assert isinstance(result, OpenClawResult)
+    assert result.text == "OpenClaw only reply"
+    oc_client.run_agent_full.assert_called_once()
+    args, kwargs = oc_client.run_agent_full.call_args
+    assert "你好" in args[0]
+    ai_resp.assert_not_called()
+    print("✅ Hybrid test passed: openclaw-only routes without prefix")
+
+
 def test_hybrid_fallback():
     """OpenClaw 失败时降级到 LLM"""
     ai_resp = MagicMock(spec=AIResponder)

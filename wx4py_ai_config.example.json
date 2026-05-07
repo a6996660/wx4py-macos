@@ -34,8 +34,9 @@
     }
   },
   "openclaw": {
-    "_说明": "OpenClaw 本地 agent 配置。启用后，@消息以指定前缀开头时会调用 OpenClaw agent 处理（慢但能力强），否则走直接 LLM（秒回）。",
+    "_说明": "OpenClaw 本地 agent 配置。mode=hybrid 表示双引擎：只有指定前缀走 OpenClaw，其余走 LLM；mode=llm 表示仅 LLM；mode=openclaw 表示仅 OpenClaw，所有 @ 消息都交给 OpenClaw 且不需要特殊前缀。",
     "enabled": false,
+    "mode": "llm",
     "agent_id": "main",
     "prefixes": ["/claw", "\\claw"],
     "timeout": 60,

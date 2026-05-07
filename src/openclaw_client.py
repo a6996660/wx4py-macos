@@ -56,6 +56,7 @@ class OpenClawConfig:
     """OpenClaw 调用配置。"""
 
     enabled: bool = False
+    mode: str = "llm"
     agent_id: str = "main"
     prefixes: List[str] = field(default_factory=lambda: ["/claw", "\\claw"])
     timeout: float = 60.0
@@ -68,12 +69,27 @@ class OpenClawConfig:
     reset_commands: List[str] = field(default_factory=lambda: ["/new", "/reset"])
     reset_reply: str = "🆕 已重置对话，开始新会话～"
 
+    def __post_init__(self) -> None:
+        allowed_modes = {"llm", "hybrid", "openclaw"}
+        mode = str(self.mode or "").strip().lower()
+        if mode not in allowed_modes:
+            mode = "hybrid" if self.enabled else "llm"
+        if self.enabled and mode == "llm":
+            mode = "hybrid"
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "enabled", mode != "llm")
+
     @classmethod
     def from_dict(cls, data: Optional[Dict]) -> "OpenClawConfig":
         if not data:
             return cls(enabled=False)
+        raw_mode = str(data.get("mode", "")).strip().lower()
+        mode = raw_mode if raw_mode in {"llm", "hybrid", "openclaw"} else (
+            "hybrid" if data.get("enabled", False) else "llm"
+        )
         return cls(
-            enabled=bool(data.get("enabled", False)),
+            enabled=mode != "llm",
+            mode=mode,
             agent_id=str(data.get("agent_id", "main")),
             prefixes=list(data.get("prefixes", ["/claw", "\\claw"])),
             timeout=float(data.get("timeout", 60.0)),
@@ -553,13 +569,19 @@ class HybridResponder:
             return self.openclaw_config.reset_reply
 
         has_prefix, clean_content = self._strip_prefix(content)
+        use_openclaw = (
+            self.openclaw_config.enabled
+            and self.openclaw_client is not None
+            and (
+                self.openclaw_config.mode == "openclaw"
+                or (self.openclaw_config.mode == "hybrid" and has_prefix)
+            )
+        )
+        if self.openclaw_config.mode == "openclaw":
+            clean_content = content
 
         # ---- OpenClaw 路径 ----
-        if (
-            has_prefix
-            and self.openclaw_config.enabled
-            and self.openclaw_client is not None
-        ):
+        if use_openclaw:
             session_id = self._get_session_id(event.group)
             _hybrid_logger.info(
                 "OpenClaw 模式: group=%s session=%s content=%s",

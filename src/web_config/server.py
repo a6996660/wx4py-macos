@@ -268,13 +268,24 @@ def _validate_config(data: Dict[str, Any]) -> Dict[str, str]:
                     errors[f"providers.{name}.{field}"] = f"{field} 不能为空"
 
     openclaw = data.get("openclaw")
-    if isinstance(openclaw, dict) and openclaw.get("enabled"):
+    if isinstance(openclaw, dict):
+        mode = str(openclaw.get("mode", "")).strip().lower()
+        if not mode:
+            mode = "hybrid" if openclaw.get("enabled") else "llm"
+        if mode not in {"llm", "hybrid", "openclaw"}:
+            errors["openclaw.mode"] = "模式必须是 hybrid、llm 或 openclaw"
+        openclaw_enabled = mode != "llm"
+    else:
+        openclaw_enabled = False
+        mode = "llm"
+
+    if isinstance(openclaw, dict) and openclaw_enabled:
         timeout = openclaw.get("timeout")
         if not isinstance(timeout, (int, float)) or timeout <= 0:
             errors["openclaw.timeout"] = "超时时间必须大于 0"
         prefixes = openclaw.get("prefixes")
-        if not isinstance(prefixes, list) or not prefixes:
-            errors["openclaw.prefixes"] = "至少需要填写一个触发前缀"
+        if mode == "hybrid" and (not isinstance(prefixes, list) or not prefixes):
+            errors["openclaw.prefixes"] = "双引擎模式至少需要填写一个触发前缀"
 
     return errors
 

@@ -231,8 +231,11 @@ def main() -> None:
                 print(f"单实例锁: {_lock_path(config_file)}")
                 print(f"阻止系统睡眠: {'已启用 caffeinate' if sleep_prevented else '未启用'}")
                 if openclaw_cfg.enabled:
-                    print(f"🦞 双引擎模式: LLM 秒回 + OpenClaw agent")
-                    print(f"    OpenClaw 前缀: {', '.join(openclaw_cfg.prefixes)}")
+                    if openclaw_cfg.mode == "openclaw":
+                        print("🦞 仅 OpenClaw 模式: 所有 @ 消息交给 OpenClaw agent")
+                    else:
+                        print("🦞 双引擎模式: LLM 秒回 + OpenClaw agent")
+                        print(f"    OpenClaw 前缀: {', '.join(openclaw_cfg.prefixes)}")
                     print(f"    OpenClaw 超时: {openclaw_cfg.timeout} 秒")
                 else:
                     print("🤖 单引擎模式: LLM 秒回")

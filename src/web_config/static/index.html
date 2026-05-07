@@ -37,6 +37,12 @@ input.error+.error-text,.form-group:has(input.error) .error-text{display:block}
 .tag button{border:none;background:none;color:var(--primary);cursor:pointer;font-size:1rem;line-height:1;padding:0 2px}
 .checkbox{display:flex;align-items:center;gap:8px;cursor:pointer}
 .checkbox input{width:auto}
+.mode-options{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.mode-option{display:flex;gap:10px;padding:12px;border:1px solid var(--border);border-radius:8px;cursor:pointer;background:#fff;min-height:92px}
+.mode-option:has(input:checked){border-color:var(--primary);background:var(--primary-light);box-shadow:0 0 0 1px rgba(79,68,229,.18)}
+.mode-option input{width:auto;margin-top:3px}
+.mode-title{display:block;font-size:.88rem;font-weight:700;color:var(--text);margin-bottom:3px}
+.mode-desc{display:block;font-size:.75rem;font-weight:400;color:var(--text-secondary);line-height:1.45}
 .provider-card{border:1px solid #e5e7eb;border-radius:8px;margin-bottom:12px;overflow:hidden}
 .provider-header{display:flex;align-items:center;gap:8px;padding:10px 14px;background:#f9fafb;cursor:pointer}
 .provider-header input{flex:1;border:none;background:transparent;padding:4px;font-weight:600;font-size:.9rem}
@@ -76,6 +82,7 @@ input.error+.error-text,.form-group:has(input.error) .error-text{display:block}
 .toast.show{transform:translateX(0)}
 .toast.success{background:#10b981}
 .toast.error{background:var(--danger)}
+@media (max-width:720px){.mode-options{grid-template-columns:1fr}.row{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -119,6 +126,33 @@ input.error+.error-text,.form-group:has(input.error) .error-text{display:block}
             <p class="error-text" id="err-delayMax"></p>
           </div>
         </div>
+      </div>
+      <div class="card">
+        <div class="section-title">引擎选择</div>
+        <div class="mode-options">
+          <label class="mode-option">
+            <input type="radio" name="ocMode" value="hybrid" />
+            <span>
+              <span class="mode-title">双引擎</span>
+              <span class="mode-desc">带触发前缀的消息走 OpenClaw，其余走 LLM</span>
+            </span>
+          </label>
+          <label class="mode-option">
+            <input type="radio" name="ocMode" value="llm" />
+            <span>
+              <span class="mode-title">仅 LLM</span>
+              <span class="mode-desc">所有消息都由默认 AI Provider 回复</span>
+            </span>
+          </label>
+          <label class="mode-option">
+            <input type="radio" name="ocMode" value="openclaw" />
+            <span>
+              <span class="mode-title">仅 OpenClaw</span>
+              <span class="mode-desc">所有消息都交给 OpenClaw，不需要特殊前缀</span>
+            </span>
+          </label>
+        </div>
+        <p class="hint" id="ocModeHint">双引擎模式下，只有特定前缀的消息会调用 OpenClaw agent。</p>
       </div>
       <div class="card">
         <div class="section-title">AI 参数</div>
@@ -177,14 +211,6 @@ input.error+.error-text,.form-group:has(input.error) .error-text{display:block}
     </div>
 
     <div class="tab-panel" data-tab="openclaw">
-      <div class="card">
-        <div class="section-title">开关</div>
-        <label class="checkbox">
-          <input type="checkbox" id="ocEnabled" />
-          <span>启用 OpenClaw 双引擎模式</span>
-        </label>
-        <p class="hint">启用后，特定前缀的消息会调用 OpenClaw agent 处理，否则走直接 LLM</p>
-      </div>
       <div class="card" id="ocBody">
         <div class="section-title">OpenClaw 参数</div>
         <div class="row">
@@ -201,6 +227,7 @@ input.error+.error-text,.form-group:has(input.error) .error-text{display:block}
         <div class="form-group">
           <label>触发前缀</label>
           <div class="tag-input" id="ocPrefixesInput"><input placeholder="输入前缀后按回车添加" /></div>
+          <p class="hint" id="ocPrefixesHint">仅双引擎模式使用；仅 OpenClaw 模式会忽略前缀。</p>
           <p class="error-text" id="err-ocPrefixes"></p>
         </div>
         <div class="row">
@@ -445,7 +472,9 @@ function loadConfig(cfg) {
   document.getElementById('defaultProvider').value = cfg.default || '';
 
   const oc = cfg.openclaw || {};
-  document.getElementById('ocEnabled').checked = !!oc.enabled;
+  const ocMode = ['hybrid','llm','openclaw'].includes(oc.mode) ? oc.mode : (oc.enabled ? 'hybrid' : 'llm');
+  const modeRadio = document.querySelector(`input[name="ocMode"][value="${ocMode}"]`);
+  if (modeRadio) modeRadio.checked = true;
   document.getElementById('ocAgentId').value = oc.agent_id ?? 'main';
   ocPrefixesTags.set(Array.isArray(oc.prefixes) ? oc.prefixes : ['/claw','\\claw']);
   document.getElementById('ocTimeout').value = oc.timeout ?? 60;
@@ -485,9 +514,10 @@ function collectConfig() {
     providers[name] = data;
   });
 
-  const ocEnabled = document.getElementById('ocEnabled').checked;
+  const ocMode = document.querySelector('input[name="ocMode"]:checked')?.value || 'llm';
   const oc = {
-    enabled: ocEnabled,
+    enabled: ocMode !== 'llm',
+    mode: ocMode,
     agent_id: document.getElementById('ocAgentId').value.trim() || 'main',
     prefixes: ocPrefixesTags.get(),
     timeout: parseFloat(document.getElementById('ocTimeout').value) || 60,
@@ -532,11 +562,23 @@ function collectConfig() {
 
 /* ---------- UI helpers ---------- */
 function toggleOcBody() {
-  const on = document.getElementById('ocEnabled').checked;
+  const mode = document.querySelector('input[name="ocMode"]:checked')?.value || 'llm';
+  const on = mode !== 'llm';
+  const prefixOn = mode === 'hybrid';
   document.getElementById('ocBody').style.opacity = on ? '1' : '0.5';
   document.getElementById('ocBody').style.pointerEvents = on ? 'auto' : 'none';
+  document.getElementById('ocPrefixesInput').style.opacity = prefixOn ? '1' : '0.55';
+  document.getElementById('ocPrefixesInput').style.pointerEvents = prefixOn ? 'auto' : 'none';
+  document.getElementById('ocModeHint').textContent = mode === 'hybrid'
+    ? '双引擎模式下，只有特定前缀的消息会调用 OpenClaw agent。'
+    : mode === 'openclaw'
+      ? '仅 OpenClaw 模式下，所有 @ 消息都会调用 OpenClaw agent，不需要特殊前缀。'
+      : '仅 LLM 模式下，不会调用 OpenClaw agent。';
+  document.getElementById('ocPrefixesHint').textContent = prefixOn
+    ? '双引擎模式必填；匹配这些前缀的消息会调用 OpenClaw。'
+    : '当前模式不使用触发前缀。';
 }
-document.getElementById('ocEnabled').addEventListener('change', toggleOcBody);
+document.querySelectorAll('input[name="ocMode"]').forEach(el => el.addEventListener('change', toggleOcBody));
 
 function toggleFmBody() {
   const on = document.getElementById('fmEnabled').checked;

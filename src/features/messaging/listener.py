@@ -90,7 +90,7 @@ class _ListenSession:
     root: object
     msg_list: object
     seen: Set[Tuple[Tuple[int, ...], str, str]]
-    seen_texts: Set[str] = field(default_factory=set)
+    seen_texts: Dict[str, float] = field(default_factory=dict)
     at_hint_pending: bool = False
     at_hint_sender: Optional[str] = None
     new_count: int = 0
@@ -102,6 +102,9 @@ class _ListenSession:
     suppress_next_scan: bool = True
     cached_session_item: Optional[object] = None
     cached_session_item_at: float = 0.0
+
+
+TEXT_DEDUPE_TTL = 10.0
 
 
 @dataclass
@@ -1016,7 +1019,7 @@ class WeChatGroupListener:
                 root=root,
                 msg_list=None,
                 seen=set(),
-                seen_texts=set(),
+                seen_texts={},
                 at_hint_pending=has_startup_at_hint,
                 at_hint_sender=_extract_sender_from_session_item(session_item, group),
                 suppress_next_scan=has_startup_at_hint,
@@ -1208,10 +1211,18 @@ class WeChatGroupListener:
 
             normalized_text = _normalize_message_text(clean_content)
             if normalized_text:
+                now = time.time()
+                expired_texts = [
+                    text
+                    for text, seen_at in session.seen_texts.items()
+                    if now - seen_at > TEXT_DEDUPE_TTL
+                ]
+                for text in expired_texts:
+                    session.seen_texts.pop(text, None)
                 if normalized_text in session.seen_texts:
                     self._update_next_scan(session, 0)
                     return
-                session.seen_texts.add(normalized_text)
+                session.seen_texts[normalized_text] = now
             if self.ignore_client_sent and self.outgoing_registry.should_ignore(session.group, clean_content):
                 self._update_next_scan(session, 0)
                 return
@@ -1231,7 +1242,7 @@ class WeChatGroupListener:
             return
         except Exception as exc:
             session.fail_count += 1
-            logger.debug(f"读取群聊消息失败: {session.group}: {exc}")
+            logger.warning("读取群聊消息失败: %s: %s", session.group, exc)
             return
 
     def _fetch_quote_from_chat(
@@ -1892,11 +1903,7 @@ class WeChatGroupListener:
         content: str,
         timeout: float = 5.0,
     ) -> bool:
-        """快速确认发送是否被明显阻断。
-
-        最短直达策略：发送动作成功后，不再扫描聊天消息列表等待 UI 回显；
-        只快速检查发送失败弹窗和目标群独立窗口。没有明显阻断就视为成功。
-        """
+        """确认回复已出现在当前聊天气泡中。"""
         expected = _normalize_message_text(content)
         if not expected:
             return False
@@ -1918,10 +1925,28 @@ class WeChatGroupListener:
                     self._last_verify_closed_detached = True
                     logger.warning("发送后快速检测到目标群独立窗口，改用独立窗口重发: %s", session.group)
                     return False
+            if self._reply_visible_in_root(session.root, expected):
+                return True
             if self._stop_event.wait(0.15):
                 return False
 
-        return True
+        return False
+
+    @staticmethod
+    def _reply_visible_in_root(root, expected: str) -> bool:
+        """检查最近可见消息气泡是否包含预期回复。"""
+        if not root or not expected:
+            return False
+        msg_list = _find_message_list(root)
+        if not msg_list:
+            return False
+        for item in reversed(_read_visible_items(msg_list)[-12:]):
+            if item.kind != "message":
+                continue
+            actual = _normalize_message_text(item.name)
+            if _is_same_outgoing_message(expected, actual):
+                return True
+        return False
 
     def _activate_group_for_send(self, session: _ListenSession) -> bool:
         last_reason = "no_window"
