@@ -67,6 +67,8 @@
 
 你可以直接在页面里配置监听群、回复延迟、引擎模式、AI 参数、日志路径、OpenClaw 等选项。点击“保存并启动”后，程序会写入 `wx4py_ai_config.json` 并继续启动机器人；不想手写 JSON 的用户也能快速接入。
 
+![启动时自动打开的配置页面](docs/images/readme/image.png)
+
 ## 存在的不足
 
 wx4py 基于 macOS Accessibility 操作微信原生客户端，优势是接入轻、无需改微信；代价是它必须依赖当前微信窗口状态。
