@@ -65,6 +65,11 @@ class OpenClawConfig:
     placeholder_text: str = "让我想想…"
     placeholder_reply_on_failure: str = "这个我直接来答吧"
     cli_path: str = ""  # 空字符串表示使用 PATH 查找
+    gateway_host: str = "127.0.0.1"
+    gateway_port: int = 18789
+    gateway_url: str = ""  # 非空时优先使用完整 WebSocket URL，例如 wss://openclaw.example.com
+    gateway_token: str = ""
+    allow_insecure_private_ws: bool = False
     file_support: bool = False  # 是否启用文件传递支持
     reset_commands: List[str] = field(default_factory=lambda: ["/new", "/reset"])
     reset_reply: str = "🆕 已重置对话，开始新会话～"
@@ -100,6 +105,11 @@ class OpenClawConfig:
                 data.get("placeholder_reply_on_failure", "这个我直接来答吧")
             ),
             cli_path=str(data.get("cli_path", "")),
+            gateway_host=str(data.get("gateway_host", "127.0.0.1")).strip() or "127.0.0.1",
+            gateway_port=int(data.get("gateway_port", 18789) or 18789),
+            gateway_url=str(data.get("gateway_url", "")).strip(),
+            gateway_token=str(data.get("gateway_token", "")).strip(),
+            allow_insecure_private_ws=bool(data.get("allow_insecure_private_ws", False)),
             file_support=bool(data.get("file_support", False)),
             reset_commands=list(data.get("reset_commands", ["/new", "/reset"])),
             reset_reply=str(data.get("reset_reply", "🆕 已重置对话，开始新会话～")),
@@ -132,6 +142,36 @@ class OpenClawClient:
             raise OpenClawNotFoundError(
                 f"OpenClaw CLI 找不到: {self._cli}"
             )
+
+    def _gateway_env(self) -> Dict[str, str]:
+        """构造 OpenClaw Gateway 连接环境变量。
+
+        默认本机地址不主动覆盖 OpenClaw CLI 自己的配置，避免影响已配置
+        非默认本机端口的用户。只有填写完整 gateway_url，或 host/port
+        不是默认值时，才通过环境变量指定 Gateway。
+        """
+        env: Dict[str, str] = {}
+        gateway_url = self.config.gateway_url.strip()
+        host = self.config.gateway_host.strip() or "127.0.0.1"
+        port = int(self.config.gateway_port or 18789)
+        if not gateway_url and (host != "127.0.0.1" or port != 18789):
+            gateway_url = f"ws://{host}:{port}"
+        if gateway_url:
+            env["OPENCLAW_GATEWAY_URL"] = gateway_url
+        if self.config.gateway_token:
+            env["OPENCLAW_GATEWAY_TOKEN"] = self.config.gateway_token
+        if self.config.allow_insecure_private_ws:
+            env["OPENCLAW_ALLOW_INSECURE_PRIVATE_WS"] = "1"
+        return env
+
+    def gateway_display(self) -> str:
+        """返回用于启动日志展示的 Gateway 目标。"""
+        gateway_url = self.config.gateway_url.strip()
+        if gateway_url:
+            return gateway_url
+        host = self.config.gateway_host.strip() or "127.0.0.1"
+        port = int(self.config.gateway_port or 18789)
+        return f"ws://{host}:{port}"
 
     @staticmethod
     def check_health(cli_path: str = "") -> tuple[bool, str]:
@@ -219,6 +259,11 @@ class OpenClawClient:
         # 处理文件：复制到 OpenClaw workspace，并在消息中嵌入路径
         effective_message = message
         call_started_at = time.time()
+        file_output_hint = (
+            "提示：如果用户要求修改、重命名、转换、导出或回传文件，"
+            "请必须在 .wx4py_files/ 下实际写出新的输出文件，并在回复中注明相对路径；"
+            "不要只描述新文件名。"
+        )
         self.last_file_context = None
         if file_path and self.config.file_support:
             workspace_input_path = ""
@@ -244,7 +289,7 @@ class OpenClawClient:
                     f"{message}\n\n"
                     f"附件：{src.name}\n"
                     f"路径：{rel_path}\n\n"
-                    f"提示：如有修改或生成文件，请在回复中注明文件路径。"
+                    f"{file_output_hint}"
                 )
                 _hybrid_logger.info(
                     "文件已复制到 OpenClaw workspace: %s -> %s",
@@ -259,7 +304,7 @@ class OpenClawClient:
                     f"{message}\n\n"
                     f"附件：{Path(file_path).name}\n"
                     f"路径：{file_path}\n\n"
-                    f"提示：如有修改或生成文件，请在回复中注明文件路径。"
+                    f"{file_output_hint}"
                 )
             finally:
                 self.last_file_context = _OpenClawFileContext(
@@ -310,10 +355,13 @@ class OpenClawClient:
         mode_label = "local" if local else "gateway"
         _hybrid_logger.info("OpenClaw CLI (%s): %s", mode_label, " ".join(cmd))
         try:
+            env = os.environ.copy()
+            env.update(self._gateway_env())
             return subprocess.run(
                 cmd,
                 capture_output=True,
                 timeout=self.config.timeout + 30,
+                env=env,
             )
         except subprocess.TimeoutExpired as exc:
             raise OpenClawTimeoutError(
@@ -632,13 +680,37 @@ class HybridResponder:
                     file_path=file_path,
                 )
                 cleaned_text = self._sanitize_reply(result.text)
-                # 从文本回复中提取 OpenClaw workspace 中的文件路径
-                # agent 有时只在文本中提及保存路径，未在 JSON file_paths 中返回
-                extracted_paths = self._extract_file_paths_from_text(cleaned_text)
+                should_send_files = self._should_send_files(clean_content)
                 all_file_paths = list(result.file_paths or [])
-                for p in extracted_paths:
-                    if p not in all_file_paths:
-                        all_file_paths.append(p)
+                if all_file_paths and not should_send_files:
+                    _hybrid_logger.info(
+                        "跳过 OpenClaw 文件回传: reason=no_send_intent, "
+                        "message=%s, files=%s",
+                        clean_content[:80],
+                        all_file_paths,
+                    )
+                    all_file_paths = []
+                # 从文本回复中提取 OpenClaw workspace 中的文件路径。
+                # 只在用户明确要求生成/修改/发送文件时启用。
+                # 否则像 “Hermes 使用 MEMORY.md 和 USER.md” 这种解释性文本
+                # 会被误判为要把 workspace 里的同名文件发到微信群。
+                if should_send_files:
+                    file_context = getattr(
+                        self.openclaw_client, "last_file_context", None
+                    )
+                    call_started_at = getattr(file_context, "started_at", 0.0)
+                    extracted_paths = self._extract_file_paths_from_text(
+                        cleaned_text,
+                        min_mtime=call_started_at,
+                    )
+                    for p in extracted_paths:
+                        if p not in all_file_paths:
+                            all_file_paths.append(p)
+                else:
+                    _hybrid_logger.debug(
+                        "跳过文本文件名反查: message=%s",
+                        clean_content[:80],
+                    )
 
                 # 兜底：如果清洗后文本为空（原始内容全是内部错误/路径），
                 # 但成功生成了文件，返回友好提示而非空消息或内部报错
@@ -646,7 +718,7 @@ class HybridResponder:
                     cleaned_text = "文件已处理完成，请查收~"
 
                 # 兜底：文本和 JSON 都没返回文件路径时，扫描 workspace 最近文件
-                if not all_file_paths and file_path:
+                if not all_file_paths and file_path and should_send_files:
                     file_context = getattr(
                         self.openclaw_client, "last_file_context", None
                     )
@@ -660,6 +732,14 @@ class HybridResponder:
                     for p in scanned:
                         if p not in all_file_paths:
                             all_file_paths.append(p)
+                    if not all_file_paths:
+                        _hybrid_logger.warning(
+                            "用户要求回传文件，但 OpenClaw 未返回或生成本次新文件: "
+                            "message=%s, input=%s, reply=%s",
+                            clean_content[:120],
+                            file_path,
+                            cleaned_text[:160],
+                        )
 
                 return OpenClawResult(
                     text=cleaned_text,
@@ -818,7 +898,48 @@ class HybridResponder:
         return MessageEvent(**kwargs)
 
     @staticmethod
-    def _extract_file_paths_from_text(text: str) -> List[str]:
+    def _should_send_files(message: str) -> bool:
+        """判断这条用户消息是否表达了文件产出/回传意图。
+
+        附件可以作为 OpenClaw 的输入，但只有用户明确要求生成、修改、
+        导出或发送文件时，wx4py 才把 OpenClaw 产物回传到微信群。
+        """
+        text = (message or "").strip().lower()
+        if not text:
+            return False
+        send_keywords = (
+            "发给我",
+            "发送给我",
+            "发送",
+            "回传",
+            "传给我",
+            "导出",
+            "生成文件",
+            "保存成",
+            "保存为",
+            "另存为",
+            "修改",
+            "改成",
+            "重命名",
+            "转成",
+            "转换成",
+            "send me",
+            "send",
+            "export",
+            "generate file",
+            "save as",
+            "modify",
+            "rename",
+            "convert",
+        )
+        return any(keyword in text for keyword in send_keywords)
+
+    @staticmethod
+    def _extract_file_paths_from_text(
+        text: str,
+        *,
+        min_mtime: float = 0.0,
+    ) -> List[str]:
         """从 OpenClaw 文本回复中提取文件路径并转为绝对路径。
 
         OpenClaw agent 有时只在文本中提及保存路径，而未在 JSON 的 file_paths
@@ -831,24 +952,56 @@ class HybridResponder:
         paths: List[str] = []
         workspace = Path.home() / ".openclaw" / "workspace"
 
+        def maybe_add(path: Path, source: str) -> None:
+            if not path.is_file():
+                _hybrid_logger.debug("文本文件路径不存在: %s", path)
+                return
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            if min_mtime > 0 and mtime + 1.0 < min_mtime:
+                _hybrid_logger.info(
+                    "跳过旧文件反查结果: source=%s, path=%s, mtime=%.3f, min=%.3f",
+                    source,
+                    path,
+                    mtime,
+                    min_mtime,
+                )
+                return
+            abs_path = str(path)
+            if abs_path not in paths:
+                paths.append(abs_path)
+                _hybrid_logger.info("从文本%s提取到文件路径: %s", source, abs_path)
+
         # 阶段1：匹配显式路径 .wx4py_files/... 或 ~/.openclaw/workspace/...
         for match in re.finditer(
             r'(?:~/\.openclaw/workspace/)?(\.wx4py_files/[^\s"\'<>]+?\.[a-zA-Z0-9]{1,10})',
             text,
         ):
             rel_path = match.group(1)
-            abs_path = str(workspace / rel_path)
-            if os.path.isfile(abs_path) and abs_path not in paths:
-                paths.append(abs_path)
-                _hybrid_logger.info("从文本中提取到文件路径: %s", abs_path)
-            else:
-                _hybrid_logger.debug(
-                    "文本路径提取后文件不存在或已重复: %s", abs_path
-                )
+            maybe_add(workspace / rel_path, "显式路径")
 
-        # 阶段2：匹配纯文件名（无路径前缀），在 workspace 及其子目录中反查
-        # OpenClaw 有时会返回 "当前目录文件列表： 表单号_55.docx ..." 这种格式
         search_dirs = [workspace, workspace / ".wx4py_files"]
+
+        # 阶段2：匹配提示性文件名，支持空格，例如 “文件名是 文件 1.md”
+        hint_pattern = (
+            r'(?:文件名(?:是|为|：|:)|保存(?:为|成|到|：|:)|路径(?:是|为|：|:)|'
+            r'file(?:name)?(?: is|:)|saved as|saved to)\s*'
+            r'([^\n\r"\'<>/\\]+?\.[a-zA-Z0-9]{1,10})'
+        )
+        for match in re.finditer(hint_pattern, text, flags=re.IGNORECASE):
+            filename = match.group(1).strip().strip("` 。，；：、！？）】》")
+            if not filename or filename.startswith("."):
+                continue
+            for base_dir in search_dirs:
+                candidate = base_dir / filename
+                if candidate.is_file():
+                    maybe_add(candidate, "提示文件名")
+                    break
+
+        # 阶段3：匹配纯文件名（无路径前缀），在 workspace 及其子目录中反查
+        # OpenClaw 有时会返回 "当前目录文件列表： 表单号_55.docx ..." 这种格式
         for match in re.finditer(
             r'[^\s"\'<>/\\，。；：、！？）】》]+?\.[a-zA-Z0-9]{1,10}',
             text,
@@ -860,12 +1013,7 @@ class HybridResponder:
             for base_dir in search_dirs:
                 candidate = base_dir / filename
                 if candidate.is_file():
-                    abs_path = str(candidate)
-                    if abs_path not in paths:
-                        paths.append(abs_path)
-                        _hybrid_logger.info(
-                            "从文本文件名反查提取到文件路径: %s", abs_path
-                        )
+                    maybe_add(candidate, "文件名反查")
                     break
 
         return paths

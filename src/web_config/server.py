@@ -38,6 +38,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "placeholder_text": "让我想想…",
         "placeholder_reply_on_failure": "这个我直接来答吧",
         "cli_path": "",
+        "gateway_host": "127.0.0.1",
+        "gateway_port": 18789,
+        "gateway_url": "",
+        "gateway_token": "",
+        "allow_insecure_private_ws": False,
         "file_support": False,
         "reset_commands": ["/new", "/reset"],
         "reset_reply": "🆕 已重置对话，开始新会话～",
@@ -286,6 +291,14 @@ def _validate_config(data: Dict[str, Any]) -> Dict[str, str]:
         prefixes = openclaw.get("prefixes")
         if mode == "hybrid" and (not isinstance(prefixes, list) or not prefixes):
             errors["openclaw.prefixes"] = "双引擎模式至少需要填写一个触发前缀"
+        gateway_port = openclaw.get("gateway_port", 18789)
+        if not isinstance(gateway_port, int) or gateway_port <= 0 or gateway_port > 65535:
+            errors["openclaw.gateway_port"] = "Gateway 端口必须是 1-65535 的整数"
+        gateway_url = str(openclaw.get("gateway_url", "")).strip()
+        if gateway_url and not (
+            gateway_url.startswith("ws://") or gateway_url.startswith("wss://")
+        ):
+            errors["openclaw.gateway_url"] = "Gateway URL 必须以 ws:// 或 wss:// 开头"
 
     return errors
 

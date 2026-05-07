@@ -194,6 +194,11 @@ python3 run_ai_group_bot.py
     "fallback_to_llm": true,
     "session_per_group": true,
     "cli_path": "/Users/xxx/.nvm/versions/node/v22.22.1/bin/openclaw",
+    "gateway_host": "127.0.0.1",
+    "gateway_port": 18789,
+    "gateway_url": "",
+    "gateway_token": "",
+    "allow_insecure_private_ws": false,
     "file_support": true,
     "reset_commands": ["/new", "/reset"]
   }
@@ -201,6 +206,15 @@ python3 run_ai_group_bot.py
 ```
 
 推荐使用 `hybrid` 模式：普通 @ 消息走 LLM，带 `/c` 或 `/claw` 的消息走 OpenClaw。
+
+OpenClaw Gateway 默认按本机部署处理，即 `ws://127.0.0.1:18789`。如果你的 OpenClaw 部署在服务器上，可以配置：
+
+- `gateway_host` / `gateway_port`：填写服务器地址和端口，例如 `10.0.0.8`、`18789`。
+- `gateway_url`：可选的完整 WebSocket 地址，填写后优先使用，例如 `wss://openclaw.example.com`。
+- `gateway_token`：远端 Gateway 开启 token 认证时填写。
+- `allow_insecure_private_ws`：默认关闭。远端建议使用 `wss://`；只有确认是可信私网或隧道时才开启明文 `ws://`。
+
+远端部署时，服务器上的 OpenClaw Gateway 需要允许 wx4py 所在机器访问；如果 Gateway 仍只绑定 loopback，推荐使用 SSH 隧道或 Tailscale Serve/Funnel 暴露安全访问地址。
 
 如需处理微信文件，还可以开启 `file_monitor`，让程序更容易发现已下载文件的真实路径：
 

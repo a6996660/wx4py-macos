@@ -259,6 +259,34 @@ input.error+.error-text,.form-group:has(input.error) .error-text{display:block}
           <input type="text" id="ocCliPath" />
           <p class="hint">留空表示从 PATH 自动查找 openclaw</p>
         </div>
+        <div class="row">
+          <div class="form-group">
+            <label>Gateway 地址</label>
+            <input type="text" id="ocGatewayHost" placeholder="127.0.0.1" />
+            <p class="hint">OpenClaw 在服务器上时填写服务器域名或 IP</p>
+          </div>
+          <div class="form-group">
+            <label>Gateway 端口</label>
+            <input type="number" id="ocGatewayPort" min="1" max="65535" step="1" />
+            <p class="error-text" id="err-ocGatewayPort"></p>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>完整 Gateway URL</label>
+          <input type="text" id="ocGatewayUrl" placeholder="ws://127.0.0.1:18789 或 wss://openclaw.example.com" />
+          <p class="hint">可选；填写后优先使用该 URL，并忽略上面的地址和端口</p>
+          <p class="error-text" id="err-ocGatewayUrl"></p>
+        </div>
+        <div class="form-group">
+          <label>Gateway Token</label>
+          <input type="password" id="ocGatewayToken" autocomplete="off" />
+          <p class="hint">如果远端 Gateway 开启 token 认证，在这里填写；留空表示使用 OpenClaw CLI 自身配置或环境变量</p>
+        </div>
+        <label class="checkbox">
+          <input type="checkbox" id="ocAllowInsecurePrivateWs" />
+          <span>允许可信私网 ws:// 明文连接</span>
+        </label>
+        <p class="hint">远端建议使用 wss://；只有在可信内网或隧道场景下才开启</p>
         <div class="form-group">
           <label>重置指令</label>
           <div class="tag-input" id="ocResetCommandsInput"><input placeholder="输入指令后按回车添加，如 /new" /></div>
@@ -486,6 +514,11 @@ function loadConfig(cfg) {
   document.getElementById('ocResetReply').value = oc.reset_reply ?? '🆕 已重置对话，开始新会话～';
   const cliPathVal = oc.cli_path ?? '';
   document.getElementById('ocCliPath').value = cliPathVal;
+  document.getElementById('ocGatewayHost').value = oc.gateway_host ?? '127.0.0.1';
+  document.getElementById('ocGatewayPort').value = oc.gateway_port ?? 18789;
+  document.getElementById('ocGatewayUrl').value = oc.gateway_url ?? '';
+  document.getElementById('ocGatewayToken').value = oc.gateway_token ?? '';
+  document.getElementById('ocAllowInsecurePrivateWs').checked = !!oc.allow_insecure_private_ws;
   document.getElementById('ocFileSupport').checked = !!oc.file_support;
   toggleOcBody();
 
@@ -526,6 +559,11 @@ function collectConfig() {
     placeholder_text: document.getElementById('ocPlaceholder').value.trim() || '让我想想…',
     placeholder_reply_on_failure: document.getElementById('ocPlaceholderFail').value.trim() || '这个我直接来答吧',
     cli_path: document.getElementById('ocCliPath').value.trim(),
+    gateway_host: document.getElementById('ocGatewayHost').value.trim() || '127.0.0.1',
+    gateway_port: parseInt(document.getElementById('ocGatewayPort').value, 10) || 18789,
+    gateway_url: document.getElementById('ocGatewayUrl').value.trim(),
+    gateway_token: document.getElementById('ocGatewayToken').value.trim(),
+    allow_insecure_private_ws: document.getElementById('ocAllowInsecurePrivateWs').checked,
     reset_commands: ocResetCommandsTags.get(),
     reset_reply: document.getElementById('ocResetReply').value.trim() || '🆕 已重置对话，开始新会话～',
     file_support: document.getElementById('ocFileSupport').checked,
@@ -606,7 +644,8 @@ function showFieldErrors(errors) {
     'groups':'groupsInput','reply_delay_range':'delayMin','ai_queue_size':'aiQueueSize',
     'ai_context_size':'aiContextSize','ai_max_reply_chars':'aiMaxReplyChars',
     'default':'defaultProvider','providers':'providersContainer',
-    'openclaw.timeout':'ocTimeout','openclaw.prefixes':'ocPrefixesInput'
+    'openclaw.timeout':'ocTimeout','openclaw.prefixes':'ocPrefixesInput',
+    'openclaw.gateway_port':'ocGatewayPort','openclaw.gateway_url':'ocGatewayUrl'
   };
   for (const [k, msg] of Object.entries(errors)) {
     let elId = map[k];

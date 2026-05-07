@@ -23,7 +23,7 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from src import (
     AIClient,
@@ -231,13 +231,16 @@ def main() -> None:
                 print(f"单实例锁: {_lock_path(config_file)}")
                 print(f"阻止系统睡眠: {'已启用 caffeinate' if sleep_prevented else '未启用'}")
                 if openclaw_cfg.enabled:
+                    openclaw_client = OpenClawClient(openclaw_cfg)
                     if openclaw_cfg.mode == "openclaw":
                         print("🦞 仅 OpenClaw 模式: 所有 @ 消息交给 OpenClaw agent")
                     else:
                         print("🦞 双引擎模式: LLM 秒回 + OpenClaw agent")
                         print(f"    OpenClaw 前缀: {', '.join(openclaw_cfg.prefixes)}")
                     print(f"    OpenClaw 超时: {openclaw_cfg.timeout} 秒")
+                    print(f"    OpenClaw Gateway: {openclaw_client.gateway_display()}")
                 else:
+                    openclaw_client = None
                     print("🤖 单引擎模式: LLM 秒回")
                 print("启动中：只有被 @ 时才会调用大模型回复。按 Ctrl+C 停止。")
 
@@ -264,7 +267,7 @@ def main() -> None:
                     if openclaw_cfg.enabled:
                         responder = HybridResponder(
                             ai_responder,
-                            openclaw_client=OpenClawClient(openclaw_cfg),
+                            openclaw_client=openclaw_client,
                             openclaw_config=openclaw_cfg,
                             file_monitor=file_monitor,
                             file_downloader=file_downloader,
