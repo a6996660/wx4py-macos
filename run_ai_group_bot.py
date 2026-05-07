@@ -120,6 +120,26 @@ def _load_groups(config: Dict[str, Any]) -> list[str]:
     return groups
 
 
+def _load_group_nicknames(config: Dict[str, Any], groups: list[str]) -> Dict[str, str]:
+    """读取机器人在群里的昵称配置。
+
+    bot_nickname 适用于所有群；group_nicknames 可覆盖单个群。
+    """
+    nickname = str(config.get("bot_nickname", "")).strip()
+    nicknames: Dict[str, str] = {}
+    if nickname:
+        nicknames = {group: nickname for group in groups}
+
+    raw_group_nicknames = config.get("group_nicknames", {})
+    if isinstance(raw_group_nicknames, dict):
+        for group, value in raw_group_nicknames.items():
+            group_name = str(group).strip()
+            group_nickname = str(value).strip()
+            if group_name and group_nickname:
+                nicknames[group_name] = group_nickname
+    return nicknames
+
+
 def _load_reply_delay_range(config: Dict[str, Any]) -> Tuple[float, float]:
     """读取自动回复随机延迟范围，默认 2 到 5 秒。"""
     value = config.get("reply_delay_range", [2, 5])
@@ -197,6 +217,7 @@ def main() -> None:
             with _prevent_system_sleep() as sleep_prevented:
                 raw_config = _load_raw_config(config_file)
                 groups = _load_groups(raw_config)
+                group_nicknames = _load_group_nicknames(raw_config, groups)
                 reply_delay_range = _load_reply_delay_range(raw_config)
                 ai_queue_size = _load_ai_queue_size(raw_config)
                 ai_context_size = _load_ai_context_size(raw_config)
@@ -265,12 +286,17 @@ def main() -> None:
                         file_downloader = WeChatFileDownloader(file_monitor)
 
                     if openclaw_cfg.enabled:
+                        from src.features.messaging import WeChatImageExtractor
+
                         responder = HybridResponder(
                             ai_responder,
                             openclaw_client=openclaw_client,
                             openclaw_config=openclaw_cfg,
                             file_monitor=file_monitor,
                             file_downloader=file_downloader,
+                            image_extractor=WeChatImageExtractor(
+                                hwnd_provider=lambda wx=wx: wx.window.hwnd
+                            ),
                             config_path=config_file,
                         )
                     else:
@@ -290,6 +316,7 @@ def main() -> None:
                                 queue_size=ai_queue_size,
                             )
                         ],
+                        group_nicknames=group_nicknames,
                         reply_delay_range=reply_delay_range,
                         block=True,
                     )

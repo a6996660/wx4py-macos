@@ -17,13 +17,14 @@ import random
 import re
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..chat import ChatWindow
 from ...platform import platform
-from ...utils.logger import get_logger, log_error_audit
+from ...utils.logger import get_logger, log_error_audit, log_send_audit
 
 logger = get_logger(__name__)
 
@@ -38,12 +39,17 @@ DEFAULT_REPLY_DELAY_RANGE = (3.0, 9.0)
 SEND_ATTEMPT_LIMIT = 3
 GROUP_SWITCH_ATTEMPT_LIMIT = 3
 GROUP_SWITCH_WAIT_SECONDS = 0.8
-SEND_VERIFY_TIMEOUT = 0.8
+SEND_VERIFY_TIMEOUT = 1.6
 RECOVERY_PAUSE_SECONDS = 0.25
 GROUP_SWITCH_FALLBACK_ACCEPT_SECONDS = 0.5
 DETACHED_WINDOW_CHECK_INTERVAL = 0.25
 QUICK_EXISTS_TIMEOUT = 0.08
 _SESSION_ITEM_CACHE_TTL = 60.0
+PENDING_GROUP_RETRY_SECONDS = 30.0
+SEND_INPUT_SETTLE_SECONDS = 0.18
+SEND_PASTE_SETTLE_SECONDS = 0.18
+SEND_FOCUS_SETTLE_SECONDS = 0.12
+SEND_FAST_VERIFY_SECONDS = 0.45
 
 _CURRENT_ACCOUNT_NICKNAME: Optional[str] = None
 _CURRENT_ACCOUNT_NICKNAME_LOCK = threading.Lock()
@@ -119,6 +125,8 @@ class _OutgoingRecord:
 class _ReplyTask:
     group: str
     content: str
+    send_id: str
+    enqueued_at: float
 
 
 class OutgoingMessageRegistry:
@@ -380,57 +388,43 @@ def _find_session_list(root):
 def _find_session_item(root, group_name: str):
     session_list = _find_session_list(root)
     if not session_list:
+        logger.debug("会话查找: group=%s session_list=False", group_name)
         return None
 
     direct_candidates = []
-    for control in _safe_children(session_list):
+    visible_items = _safe_children(session_list)
+    visible_names = []
+    for control in visible_items:
         name = _safe_text(control, "Name")
         auto_id = _safe_text(control, "AutomationId")
+        if name or auto_id:
+            visible_names.append(f"{auto_id}:{name[:40]}")
         score = 0
         if group_name in name:
             score += 100
         if auto_id == f"{MACOS_SESSION_ITEM_PREFIX}{group_name}":
             score += 120
-        if auto_id.startswith(MACOS_SESSION_ITEM_PREFIX):
-            score += 30
         if score:
             direct_candidates.append((score, control))
     if direct_candidates:
         direct_candidates.sort(key=lambda item: item[0], reverse=True)
-        return direct_candidates[0][1]
+        selected = direct_candidates[0][1]
+        logger.debug(
+            "会话查找: group=%s source=direct candidates=%s selected_auto_id=%r selected_name=%r",
+            group_name,
+            len(direct_candidates),
+            _safe_text(selected, "AutomationId"),
+            _safe_text(selected, "Name")[:120],
+        )
+        return selected
 
-    candidates = []
-    try:
-        for control, depth in platform.automation.walk_control(session_list, include_top=False, max_depth=3):
-            control_type = _safe_text(control, "ControlTypeName")
-            auto_id = _safe_text(control, "AutomationId")
-            if control_type != "ListItemControl" and not auto_id.startswith(MACOS_SESSION_ITEM_PREFIX):
-                continue
-            name = _safe_text(control, "Name")
-            cls = _safe_text(control, "ClassName")
-            score = 0
-            if group_name in name:
-                score += 100
-            if auto_id == f"{MACOS_SESSION_ITEM_PREFIX}{group_name}":
-                score += 120
-            if "Session" in cls or "Conversation" in cls or "Cell" in cls:
-                score += 30
-            if auto_id.startswith(MACOS_SESSION_ITEM_PREFIX):
-                score += 30
-            try:
-                if control.IsSelected:
-                    score += 80
-            except Exception:
-                pass
-            if score:
-                candidates.append((score, depth, control))
-    except Exception:
-        return None
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: (item[0], -item[1]), reverse=True)
-    return candidates[0][2]
+    logger.debug(
+        "会话查找: group=%s source=visible candidates=0 visible_count=%s visible=%s",
+        group_name,
+        len(visible_items),
+        visible_names[:12],
+    )
+    return None
 
 
 def _normalize_chat_title(text: str) -> str:
@@ -721,6 +715,17 @@ _FILE_EXT_WHITELIST = {
 }
 
 
+def _is_image_attachment_marker(text: str) -> bool:
+    """判断文本是否是微信图片/照片附件标记。"""
+    value = str(text or "").strip()
+    return bool(
+        re.match(
+            r"^(?:\[(?:图片|Image|照片|Photo)\](?:\s*.*)?|图片|Image|照片|Photo)$",
+            value,
+        )
+    )
+
+
 def _parse_attachment_from_text(
     text: str, group_name: str, current_content: Optional[str] = None
 ) -> Tuple[Optional[str], Optional[str]]:
@@ -759,10 +764,12 @@ def _parse_attachment_from_text(
                 content_idx = i
                 break
         if content_idx >= 0:
-            # 只检查 current_content 所在行及其前一行（附件通常在消息之前）
+            # 检查 current_content 所在行及相邻行（附件预览可能在消息前后）
             if content_idx > 0:
                 check_indices.append(content_idx - 1)
             check_indices.append(content_idx)
+            if content_idx + 1 < len(candidate_lines):
+                check_indices.append(content_idx + 1)
         else:
             # 没找到 current_content，回退到只检查最后一条候选行
             check_indices.append(len(candidate_lines) - 1)
@@ -802,6 +809,14 @@ def _parse_attachment_from_text(
             content = content.split(":", 1)[1].strip()
         elif "：" in content:
             content = content.split("：", 1)[1].strip()
+        if _is_image_attachment_marker(content):
+            logger.info(
+                "诊断-附件命中图片: group=%s, idx=%s, raw_line=%r",
+                group_name,
+                idx,
+                check_line,
+            )
+            return None, "image"
         content = re.sub(r"^\[[^\]]+\]\s*", "", content).strip()
 
         # 策略 1: 匹配 [文件] filename 或 [File] filename
@@ -815,7 +830,7 @@ def _parse_attachment_from_text(
                 check_line,
             )
             return m.group(1).strip(), "file"
-        if re.match(r"^\[(?:图片|Image|照片|Photo)\]", content):
+        if _is_image_attachment_marker(content):
             logger.info(
                 "诊断-附件命中图片: group=%s, idx=%s, raw_line=%r",
                 group_name,
@@ -944,6 +959,9 @@ class WeChatGroupListener:
         shared_registry = getattr(self.client, "outgoing_registry", None)
         self.outgoing_registry = shared_registry or OutgoingMessageRegistry(outgoing_ttl)
         self.sessions: Dict[str, _ListenSession] = {}
+        self.pending_groups: Set[str] = set()
+        self._next_pending_group_retry_at = 0.0
+        self._pending_group_log_at: Dict[str, float] = {}
         self._reply_queue: "queue.Queue[_ReplyTask]" = queue.Queue()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -1002,37 +1020,95 @@ class WeChatGroupListener:
         for group in self.groups:
             if group in self.sessions:
                 continue
+            self._open_session(group, startup=True)
 
-            if self.reply_on_at and not self.group_nicknames.get(group):
-                nickname = _get_current_account_nickname(self.client.window.uia.root)
-                if nickname:
-                    self.group_nicknames[group] = nickname
+        if self.pending_groups:
+            logger.warning(
+                "部分群聊当前不在左侧可见会话列表，先跳过并后台重试: %s",
+                ", ".join(sorted(self.pending_groups)),
+            )
+            self._next_pending_group_retry_at = time.time() + PENDING_GROUP_RETRY_SECONDS
 
+    def _open_session(self, group: str, *, startup: bool = False) -> bool:
+        if group in self.sessions:
+            self.pending_groups.discard(group)
+            return True
+
+        if self.reply_on_at and not self.group_nicknames.get(group):
+            # 不在启动期点击左上角头像读取当前账号昵称。macOS 微信 4.x
+            # 点击头像/关闭资料卡会扰动左侧虚拟会话列表，导致当前置顶群被
+            # 挪出可见区域。没有昵称时仍可靠左侧 [有人@我] 预览作为 at_hint。
+            logger.debug("跳过启动期昵称读取: group=%s", group)
+
+        try:
             root = platform.automation.control_from_handle(self.client.window.hwnd)
             session_item = _find_session_item(root, group)
-            if not session_item:
-                raise RuntimeError(f"左侧会话列表未找到群聊，macOS 监听不会回退搜索: {group}")
-            has_startup_at_hint = _session_item_has_at_me(session_item)
-            self.sessions[group] = _ListenSession(
-                group=group,
-                hwnd=self.client.window.hwnd,
-                root=root,
-                msg_list=None,
-                seen=set(),
-                seen_texts={},
-                at_hint_pending=has_startup_at_hint,
-                at_hint_sender=_extract_sender_from_session_item(session_item, group),
-                suppress_next_scan=has_startup_at_hint,
-            )
+        except Exception as exc:
+            logger.warning("群聊注册失败: group=%s error=%s", group, exc)
+            self.pending_groups.add(group)
+            return False
+
+        if not session_item:
+            self._log_pending_group_missing(group, startup=startup)
+            self.pending_groups.add(group)
+            return False
+
+        has_startup_at_hint = _session_item_has_at_me(session_item)
+        self.sessions[group] = _ListenSession(
+            group=group,
+            hwnd=self.client.window.hwnd,
+            root=root,
+            msg_list=None,
+            seen=set(),
+            seen_texts={},
+            at_hint_pending=has_startup_at_hint,
+            at_hint_sender=_extract_sender_from_session_item(session_item, group),
+            suppress_next_scan=has_startup_at_hint,
+        )
+        self.pending_groups.discard(group)
+        logger.info(
+            "群聊注册成功: group=%s startup=%s at_hint=%s",
+            group,
+            startup,
+            has_startup_at_hint,
+        )
+        return True
 
     def _run_loop(self) -> None:
         logger.info(f"开始监听群聊: {', '.join(self.groups)}")
         while not self._stop_event.is_set():
             now = time.time()
+            self._retry_pending_groups(now)
             for session in self._due_sessions(now):
                 self._poll_session(session)
             time.sleep(self.tick)
         logger.info("群聊监听已停止")
+
+    def _retry_pending_groups(self, now: float) -> None:
+        if not self.pending_groups or now < self._next_pending_group_retry_at:
+            return
+        self._next_pending_group_retry_at = now + PENDING_GROUP_RETRY_SECONDS
+        groups = list(self.pending_groups)
+        logger.info("重试注册不可见群聊: groups=%s", groups)
+        for group in groups:
+            self._open_session(group, startup=False)
+
+    def _log_pending_group_missing(self, group: str, *, startup: bool) -> None:
+        now = time.time()
+        last_at = self._pending_group_log_at.get(group, 0.0)
+        if startup or now - last_at >= 60.0:
+            logger.warning(
+                "群聊当前不可见，暂不注册监听: group=%s startup=%s",
+                group,
+                startup,
+            )
+            self._pending_group_log_at[group] = now
+        else:
+            logger.debug(
+                "群聊当前不可见，暂不注册监听: group=%s startup=%s",
+                group,
+                startup,
+            )
 
     def _due_sessions(self, now: float) -> List[_ListenSession]:
         sessions = [
@@ -1145,8 +1221,8 @@ class WeChatGroupListener:
                             session.group, attachment_name,
                         )
                         break
-                    # 策略 B: 匹配 [图片] / [Image] / [照片] / [Photo]
-                    if re.match(r"^\[(?:图片|Image|照片|Photo)\]", q_line):
+                    # 策略 B: 匹配 [图片] / 图片 / [Image] 等图片引用标记
+                    if _is_image_attachment_marker(q_line):
                         attachment_type = "image"
                         logger.info(
                             "引用内容识别为图片: group=%s", session.group
@@ -1254,6 +1330,13 @@ class WeChatGroupListener:
         """点击打开群聊，读取最新消息气泡，尝试提取引用内容。
 
         注意：这会临时切换当前聊天窗口到目标群聊。
+
+        这段是自动回复发送链路的前置步骤：收到 @ 后，如果当前右侧
+        聊天窗口不在目标群，这里会先点击左侧目标群以读取引用/图片。
+        后续模型生成回复后会进入 _activate_group_for_send。由于微信 4.x
+        在“当前会话已打开”时再次点击左侧同一个会话，会把右侧聊天区
+        切成空白态，所以这里点击成功后必须写入发送状态，供发送阶段
+        复用，避免第二次点击同一个群。
         """
         try:
             # 如果当前有发送正在进行，跳过点击切群，避免覆盖发送状态
@@ -1276,7 +1359,9 @@ class WeChatGroupListener:
                 logger.debug("获取引用: 点击打开群聊 group=%s", session.group)
                 _click_session_item(session_item)
                 time.sleep(0.3)
-                # 更新发送状态，避免后续发送流程重复切群导致 AX 竞争
+                # 记录“目标群刚刚被读取阶段打开”。发送阶段会优先检查这个
+                # 状态并跳过左侧点击；不要删掉，否则模型回复后可能二次点击
+                # 当前群，导致微信右侧聊天区变成空白。
                 self._set_send_state(group=session.group, group_at=time.time())
                 try:
                     session.root = platform.automation.control_from_handle(self.client.window.hwnd)
@@ -1561,7 +1646,7 @@ class WeChatGroupListener:
                 session.interval = 0.3
         session.next_scan_at = now + session.interval
 
-    def reply(self, group: str, content: str) -> bool:
+    def reply(self, group: str, content: str, *, send_id: str = "") -> bool:
         """立即在微信主窗口回复群聊。
 
         注意：该方法会直接操作窗口、剪贴板和焦点。自动回复默认不直接调用它，
@@ -1572,7 +1657,21 @@ class WeChatGroupListener:
         if not session:
             raise ValueError(f"未监听群聊: {group}")
 
-        self._sleep_before_reply(group, content)
+        started_at = time.time()
+        self._log_send_stage(
+            "reply_start",
+            group=group,
+            send_id=send_id,
+            reply=content,
+        )
+        delay = self._sleep_before_reply(group, content)
+        self._log_send_stage(
+            "reply_delay_done",
+            group=group,
+            send_id=send_id,
+            reply=content,
+            elapsed_ms=int(delay * 1000),
+        )
         if self._stop_event.is_set():
             return False
 
@@ -1580,7 +1679,15 @@ class WeChatGroupListener:
             # 先登记，再发送，避免微信回流速度快于登记速度导致漏判。
             self.outgoing_registry.record(group, content)
 
-        sent = self._send_in_subwindow(session, content)
+        sent = self._send_in_subwindow(session, content, send_id=send_id)
+        self._log_send_stage(
+            "reply_done",
+            group=group,
+            send_id=send_id,
+            success=sent,
+            reply=content,
+            elapsed_ms=int((time.time() - started_at) * 1000),
+        )
         return sent
 
     @staticmethod
@@ -1611,7 +1718,21 @@ class WeChatGroupListener:
         content = (content or "").strip()
         if not content:
             return
-        self._reply_queue.put(_ReplyTask(group=group, content=content))
+        send_id = uuid.uuid4().hex[:12]
+        task = _ReplyTask(
+            group=group,
+            content=content,
+            send_id=send_id,
+            enqueued_at=time.time(),
+        )
+        self._reply_queue.put(task)
+        self._log_send_stage(
+            "queued",
+            group=group,
+            send_id=send_id,
+            reply=content,
+            queue_size=self._reply_queue.qsize(),
+        )
 
     def _start_sender(self) -> None:
         if self._sender_thread and self._sender_thread.is_alive():
@@ -1628,7 +1749,15 @@ class WeChatGroupListener:
                 continue
 
             try:
-                self.reply(task.group, task.content)
+                self._log_send_stage(
+                    "dequeued",
+                    group=task.group,
+                    send_id=task.send_id,
+                    reply=task.content,
+                    queued_ms=int((time.time() - task.enqueued_at) * 1000),
+                    queue_size=self._reply_queue.qsize(),
+                )
+                self.reply(task.group, task.content, send_id=task.send_id)
             except Exception as exc:
                 logger.exception(f"发送队列回复失败: {task.group}: {exc}")
                 log_error_audit(
@@ -1638,6 +1767,34 @@ class WeChatGroupListener:
                 )
             finally:
                 self._reply_queue.task_done()
+
+    @staticmethod
+    def _log_send_stage(
+        stage: str,
+        *,
+        group: str,
+        send_id: str = "",
+        attempt: int = 0,
+        success: Optional[bool] = None,
+        reason: str = "",
+        elapsed_ms: Optional[int] = None,
+        reply: str = "",
+        **extra,
+    ) -> None:
+        payload = {
+            "kind": "group_reply_send",
+            "stage": stage,
+            "send_id": send_id,
+            "group": group,
+            "attempt": attempt,
+            "success": success,
+            "reason": reason,
+            "elapsed_ms": elapsed_ms,
+            "reply_len": len(reply or ""),
+            "reply_preview": (reply or "")[:120],
+            **extra,
+        }
+        log_send_audit(payload)
 
     def _get_send_state(self):
         """原子读取当前发送状态快照。"""
@@ -1705,6 +1862,7 @@ class WeChatGroupListener:
         reason: str,
         content: str = "",
         attempt: int = 0,
+        send_id: str = "",
     ) -> bool:
         """恢复发送表面：关闭弹窗/独立聊天窗口，重新激活主窗口。
 
@@ -1726,13 +1884,32 @@ class WeChatGroupListener:
                 "attempt": attempt,
             },
         )
+        self._log_send_stage(
+            "recover_start",
+            group=session.group,
+            send_id=send_id,
+            attempt=attempt,
+            reason=reason,
+            reply=content,
+        )
 
+        started_at = time.time()
         detached_root = _get_detached_group_root(session.group) if content else None
         if detached_root:
             logger.warning("恢复时保留目标群独立窗口，下一轮直接在独立窗口发送: %s", session.group)
             session.root = detached_root
             self._set_send_state(group=None, detached=True)
             self._stop_event.wait(RECOVERY_PAUSE_SECONDS)
+            self._log_send_stage(
+                "recover_done",
+                group=session.group,
+                send_id=send_id,
+                attempt=attempt,
+                success=True,
+                reason="detached_root_kept",
+                elapsed_ms=int((time.time() - started_at) * 1000),
+                reply=content,
+            )
             return False
 
         closed, _ = _close_detached_group_windows(session.group)
@@ -1751,11 +1928,31 @@ class WeChatGroupListener:
 
         self._set_send_state(group=None)
         self._stop_event.wait(RECOVERY_PAUSE_SECONDS)
+        self._log_send_stage(
+            "recover_done",
+            group=session.group,
+            send_id=send_id,
+            attempt=attempt,
+            success=True,
+            reason="main_root_restored",
+            elapsed_ms=int((time.time() - started_at) * 1000),
+            reply=content,
+            closed_detached=closed,
+        )
         return False
 
-    def _send_in_subwindow(self, session: _ListenSession, content: str) -> bool:
+    def _send_in_subwindow(self, session: _ListenSession, content: str, *, send_id: str = "") -> bool:
         last_reason = ""
+        overall_started_at = time.time()
         for attempt in range(1, SEND_ATTEMPT_LIMIT + 1):
+            attempt_started_at = time.time()
+            self._log_send_stage(
+                "attempt_start",
+                group=session.group,
+                send_id=send_id,
+                attempt=attempt,
+                reply=content,
+            )
             if self._stop_event.is_set():
                 return False
             if attempt > 1:
@@ -1764,9 +1961,20 @@ class WeChatGroupListener:
                     reason=last_reason or "retry",
                     content=content,
                     attempt=attempt,
+                    send_id=send_id,
                 )
                 if recovered_visible:
                     self._set_send_state(group=session.group, group_at=time.time())
+                    self._log_send_stage(
+                        "attempt_done",
+                        group=session.group,
+                        send_id=send_id,
+                        attempt=attempt,
+                        success=True,
+                        reason="recovered_visible",
+                        elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                        reply=content,
+                    )
                     return True
 
             current_group, _, current_detached, _ = self._get_send_state()
@@ -1775,7 +1983,7 @@ class WeChatGroupListener:
             self._set_send_state(detached=False)
             # 标记发送进行中，防止监视线程的 _fetch_quote_from_chat 覆盖发送状态
             self._set_send_state(in_progress=True)
-            if not self._activate_group_for_send(session):
+            if not self._activate_group_for_send(session, send_id=send_id, send_attempt=attempt):
                 self._set_send_state(in_progress=False)
                 last_reason = "activate_group_failed"
                 logger.warning(
@@ -1784,31 +1992,33 @@ class WeChatGroupListener:
                     SEND_ATTEMPT_LIMIT,
                     session.group,
                 )
+                self._log_send_stage(
+                    "attempt_done",
+                    group=session.group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=False,
+                    reason=last_reason,
+                    elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                    reply=content,
+                )
                 continue
 
             root = session.root
-            sent = self._send_text_direct(root, content)
-            if not sent:
-                edit = self._find_chat_input(root)
-                if not edit:
-                    self._set_send_state(in_progress=False)
-                    last_reason = "chat_input_missing"
-                    logger.warning(
-                        "发送尝试 %s/%s 未找到聊天输入框: %s",
-                        attempt,
-                        SEND_ATTEMPT_LIMIT,
-                        session.group,
-                    )
-                    continue
-
-                sent = ChatWindow.send_text_via_input(
-                    edit,
-                    content,
-                    clipboard_error="写入回复到剪贴板失败",
-                    send_error=f"发送群聊回复失败: {session.group}",
-                    logger_override=logger,
-                )
-            if _dismiss_send_failure_dialog(session.root):
+            sent = self._send_text_via_chat_input(root, session.group, content, attempt, send_id=send_id)
+            failure_check_started_at = time.time()
+            failure_dialog = _dismiss_send_failure_dialog(session.root)
+            self._log_send_stage(
+                "failure_dialog_checked",
+                group=session.group,
+                send_id=send_id,
+                attempt=attempt,
+                success=not failure_dialog,
+                reason="found" if failure_dialog else "not_found",
+                elapsed_ms=int((time.time() - failure_check_started_at) * 1000),
+                reply=content,
+            )
+            if failure_dialog:
                 logger.error(f"微信提示发送失败: {session.group}")
                 self._set_send_state(group=None, detached=False, in_progress=False)
                 log_error_audit(
@@ -1816,8 +2026,24 @@ class WeChatGroupListener:
                     {"group": session.group, "reply": content, "attempt": attempt},
                 )
                 last_reason = "wechat_send_failure_dialog"
+                self._log_send_stage(
+                    "attempt_done",
+                    group=session.group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=False,
+                    reason=last_reason,
+                    elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                    reply=content,
+                )
                 continue
-            if sent and self._verify_reply_visible(session, content, timeout=SEND_VERIFY_TIMEOUT):
+            if sent and self._verify_reply_visible(
+                session,
+                content,
+                timeout=SEND_VERIFY_TIMEOUT,
+                send_id=send_id,
+                attempt=attempt,
+            ):
                 _, _, verify_detached, _ = self._get_send_state()
                 if verify_detached:
                     _close_detached_group_windows(session.group, expected_message=content)
@@ -1825,6 +2051,16 @@ class WeChatGroupListener:
                     session.root = None
                     self._stop_event.wait(0.3)
                 self._set_send_state(group=session.group, group_at=time.time(), in_progress=False)
+                self._log_send_stage(
+                    "attempt_done",
+                    group=session.group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=True,
+                    reason="verified_visible",
+                    elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                    reply=content,
+                )
                 return True
             if sent and self._last_verify_closed_detached and attempt < SEND_ATTEMPT_LIMIT:
                 logger.warning("检测到回复流程进入独立聊天窗口，下一轮改用独立窗口发送: %s", session.group)
@@ -1835,15 +2071,40 @@ class WeChatGroupListener:
                 self._set_send_state(group=None, detached=False, in_progress=False)
                 last_reason = "detached_window_detected_retry"
                 self._stop_event.wait(0.8)
+                self._log_send_stage(
+                    "attempt_done",
+                    group=session.group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=False,
+                    reason=last_reason,
+                    elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                    reply=content,
+                )
                 continue
             if sent:
                 last_reason = "reply_not_visible_after_send"
                 logger.warning(
-                    "发送尝试 %s/%s 后未确认到回复: %s -> %s",
+                    "发送尝试 %s/%s 后未确认到回复: group=%s reply_len=%s preview=%s",
                     attempt,
                     SEND_ATTEMPT_LIMIT,
                     session.group,
+                    len(content),
                     content[:80],
+                )
+                log_error_audit(
+                    "reply_not_visible_after_send",
+                    {"group": session.group, "reply": content, "attempt": attempt},
+                )
+                self._log_send_stage(
+                    "attempt_done",
+                    group=session.group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=False,
+                    reason=last_reason,
+                    elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                    reply=content,
                 )
                 continue
             last_reason = "send_text_failed"
@@ -1852,6 +2113,16 @@ class WeChatGroupListener:
                 attempt,
                 SEND_ATTEMPT_LIMIT,
                 session.group,
+            )
+            self._log_send_stage(
+                "attempt_done",
+                group=session.group,
+                send_id=send_id,
+                attempt=attempt,
+                success=False,
+                reason=last_reason,
+                elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                reply=content,
             )
 
         logger.error(
@@ -1865,7 +2136,364 @@ class WeChatGroupListener:
             "reply_failed_after_retries",
             {"group": session.group, "reply": content, "reason": last_reason},
         )
+        self._log_send_stage(
+            "send_failed",
+            group=session.group,
+            send_id=send_id,
+            success=False,
+            reason=last_reason,
+            elapsed_ms=int((time.time() - overall_started_at) * 1000),
+            reply=content,
+        )
         return False
+
+    @staticmethod
+    def _send_text_via_chat_input(
+        root,
+        group: str,
+        content: str,
+        attempt: int,
+        *,
+        send_id: str = "",
+    ) -> bool:
+        """通过明确的聊天输入框发送，避免坐标误点导致草稿残留。"""
+        started_at = time.time()
+        WeChatGroupListener._log_send_stage(
+            "input_start",
+            group=group,
+            send_id=send_id,
+            attempt=attempt,
+            reply=content,
+            root=bool(root),
+        )
+        if not root or not content:
+            logger.warning(
+                "发送输入阶段跳过: group=%s attempt=%s root=%s content_len=%s",
+                group,
+                attempt,
+                bool(root),
+                len(content or ""),
+            )
+            WeChatGroupListener._log_send_stage(
+                "input_done",
+                group=group,
+                send_id=send_id,
+                attempt=attempt,
+                success=False,
+                reason="missing_root_or_content",
+                elapsed_ms=int((time.time() - started_at) * 1000),
+                reply=content,
+            )
+            return False
+
+        WeChatGroupListener._log_send_surface(root, group, attempt, "before_find_input")
+        find_started_at = time.time()
+        edit = WeChatGroupListener._find_chat_input(root)
+        WeChatGroupListener._log_send_stage(
+            "input_found",
+            group=group,
+            send_id=send_id,
+            attempt=attempt,
+            success=bool(edit),
+            elapsed_ms=int((time.time() - find_started_at) * 1000),
+            reply=content,
+        )
+        if not edit:
+            logger.warning(
+                "发送输入阶段失败: group=%s attempt=%s reason=chat_input_missing",
+                group,
+                attempt,
+            )
+            log_error_audit(
+                "send_input_missing",
+                {"group": group, "attempt": attempt, "reply": content},
+            )
+            WeChatGroupListener._log_send_stage(
+                "input_done",
+                group=group,
+                send_id=send_id,
+                attempt=attempt,
+                success=False,
+                reason="chat_input_missing",
+                elapsed_ms=int((time.time() - started_at) * 1000),
+                reply=content,
+            )
+            return False
+
+        WeChatGroupListener._log_control_rect("发送输入框命中", edit, group, attempt)
+        if not WeChatGroupListener._focus_chat_input(root, edit, group, attempt, send_id=send_id, reply=content):
+            logger.warning(
+                "发送输入阶段失败: group=%s attempt=%s reason=focus_input_failed",
+                group,
+                attempt,
+            )
+            log_error_audit(
+                "send_input_focus_failed",
+                {"group": group, "attempt": attempt, "reply": content},
+            )
+            WeChatGroupListener._log_send_stage(
+                "input_done",
+                group=group,
+                send_id=send_id,
+                attempt=attempt,
+                success=False,
+                reason="focus_input_failed",
+                elapsed_ms=int((time.time() - started_at) * 1000),
+                reply=content,
+            )
+            return False
+
+        if not WeChatGroupListener._clear_focused_input(edit, group, attempt, send_id=send_id, reply=content):
+            logger.warning(
+                "发送输入阶段失败: group=%s attempt=%s reason=clear_input_failed",
+                group,
+                attempt,
+            )
+            WeChatGroupListener._log_send_stage(
+                "input_done",
+                group=group,
+                send_id=send_id,
+                attempt=attempt,
+                success=False,
+                reason="clear_input_failed",
+                elapsed_ms=int((time.time() - started_at) * 1000),
+                reply=content,
+            )
+            return False
+
+        time.sleep(SEND_INPUT_SETTLE_SECONDS)
+        paste_started_at = time.time()
+        if not ChatWindow.paste_text_into_focused_input(
+            content,
+            log_error="写入回复到剪贴板失败",
+            logger_override=logger,
+        ):
+            logger.warning(
+                "发送输入阶段失败: group=%s attempt=%s reason=paste_failed",
+                group,
+                attempt,
+            )
+            WeChatGroupListener._log_send_stage(
+                "paste_done",
+                group=group,
+                send_id=send_id,
+                attempt=attempt,
+                success=False,
+                reason="paste_failed",
+                elapsed_ms=int((time.time() - paste_started_at) * 1000),
+                reply=content,
+            )
+            WeChatGroupListener._log_send_stage(
+                "input_done",
+                group=group,
+                send_id=send_id,
+                attempt=attempt,
+                success=False,
+                reason="paste_failed",
+                elapsed_ms=int((time.time() - started_at) * 1000),
+                reply=content,
+            )
+            return False
+        WeChatGroupListener._log_send_stage(
+            "paste_done",
+            group=group,
+            send_id=send_id,
+            attempt=attempt,
+            success=True,
+            elapsed_ms=int((time.time() - paste_started_at) * 1000),
+            reply=content,
+        )
+
+        time.sleep(SEND_PASTE_SETTLE_SECONDS)
+        WeChatGroupListener._log_send_surface(root, group, attempt, "after_paste")
+
+        button = WeChatGroupListener._find_send_button(root)
+        if button:
+            WeChatGroupListener._log_control_rect("发送按钮命中", button, group, attempt)
+            if _click_control(button):
+                logger.info(
+                    "发送动作完成: group=%s attempt=%s method=send_button",
+                    group,
+                    attempt,
+                )
+                time.sleep(0.3)
+                WeChatGroupListener._log_send_stage(
+                    "send_key_done",
+                    group=group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=True,
+                    reason="send_button",
+                    elapsed_ms=int((time.time() - started_at) * 1000),
+                    reply=content,
+                )
+                return True
+            logger.warning(
+                "发送按钮点击失败: group=%s attempt=%s",
+                group,
+                attempt,
+            )
+        else:
+            logger.info("发送按钮未命中，改用键盘发送: group=%s attempt=%s", group, attempt)
+
+        enter_ok = False
+        try:
+            edit.SendKeys("{Enter}")
+            enter_ok = True
+            logger.info("发送键盘动作完成: group=%s attempt=%s method=input_enter", group, attempt)
+            WeChatGroupListener._log_send_stage(
+                "send_key_done",
+                group=group,
+                send_id=send_id,
+                attempt=attempt,
+                success=True,
+                reason="input_enter",
+                elapsed_ms=int((time.time() - started_at) * 1000),
+                reply=content,
+            )
+            if WeChatGroupListener._reply_visible_in_root(root, _normalize_message_text(content)):
+                logger.info("发送后快速确认成功: group=%s attempt=%s method=input_enter", group, attempt)
+                WeChatGroupListener._log_send_stage(
+                    "input_done",
+                    group=group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=True,
+                    reason="input_enter_fast_verified",
+                    elapsed_ms=int((time.time() - started_at) * 1000),
+                    reply=content,
+                )
+                return True
+            time.sleep(SEND_FAST_VERIFY_SECONDS)
+            if WeChatGroupListener._reply_visible_in_root(root, _normalize_message_text(content)):
+                logger.info("发送后快速确认成功: group=%s attempt=%s method=input_enter_wait", group, attempt)
+                WeChatGroupListener._log_send_stage(
+                    "input_done",
+                    group=group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=True,
+                    reason="input_enter_wait_verified",
+                    elapsed_ms=int((time.time() - started_at) * 1000),
+                    reply=content,
+                )
+                return True
+        except Exception as exc:
+            logger.warning(
+                "输入框 Enter 发送失败: group=%s attempt=%s error=%s",
+                group,
+                attempt,
+                exc,
+            )
+
+        try:
+            edit.SendKeys("{Ctrl}{Enter}")
+            logger.info("发送键盘动作完成: group=%s attempt=%s method=input_cmd_enter", group, attempt)
+            time.sleep(0.3)
+            WeChatGroupListener._log_send_stage(
+                "send_key_done",
+                group=group,
+                send_id=send_id,
+                attempt=attempt,
+                success=True,
+                reason="input_cmd_enter",
+                elapsed_ms=int((time.time() - started_at) * 1000),
+                reply=content,
+            )
+            WeChatGroupListener._log_send_stage(
+                "input_done",
+                group=group,
+                send_id=send_id,
+                attempt=attempt,
+                success=True,
+                reason="input_cmd_enter_sent",
+                elapsed_ms=int((time.time() - started_at) * 1000),
+                reply=content,
+            )
+            return True
+        except Exception as exc:
+            if enter_ok:
+                logger.warning(
+                    "Cmd/Ctrl+Enter 发送失败，但 Enter 已执行: group=%s attempt=%s error=%s",
+                    group,
+                    attempt,
+                    exc,
+                )
+                time.sleep(0.2)
+                WeChatGroupListener._log_send_stage(
+                    "input_done",
+                    group=group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=True,
+                    reason="enter_executed_cmd_enter_failed",
+                    elapsed_ms=int((time.time() - started_at) * 1000),
+                    reply=content,
+                )
+                return True
+            logger.error(
+                "发送动作最终失败: group=%s attempt=%s error=%s",
+                group,
+                attempt,
+                exc,
+            )
+            log_error_audit(
+                "send_action_failed",
+                {"group": group, "attempt": attempt, "reply": content, "error": str(exc)},
+            )
+            WeChatGroupListener._log_send_stage(
+                "input_done",
+                group=group,
+                send_id=send_id,
+                attempt=attempt,
+                success=False,
+                reason="send_action_failed",
+                elapsed_ms=int((time.time() - started_at) * 1000),
+                reply=content,
+                error=str(exc),
+            )
+            return False
+
+    @staticmethod
+    def _clear_focused_input(
+        edit,
+        group: str,
+        attempt: int,
+        *,
+        send_id: str = "",
+        reply: str = "",
+    ) -> bool:
+        started_at = time.time()
+        try:
+            edit.SendKeys("{Ctrl}a")
+            time.sleep(0.05)
+            edit.SendKeys("{Delete}")
+            time.sleep(0.05)
+            logger.info("输入框清空完成: group=%s attempt=%s", group, attempt)
+            WeChatGroupListener._log_send_stage(
+                "clear_input_done",
+                group=group,
+                send_id=send_id,
+                attempt=attempt,
+                success=True,
+                elapsed_ms=int((time.time() - started_at) * 1000),
+                reply=reply,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("输入框清空失败: group=%s attempt=%s error=%s", group, attempt, exc)
+            WeChatGroupListener._log_send_stage(
+                "clear_input_done",
+                group=group,
+                send_id=send_id,
+                attempt=attempt,
+                success=False,
+                reason="exception",
+                elapsed_ms=int((time.time() - started_at) * 1000),
+                reply=reply,
+                error=str(exc),
+            )
+            return False
 
     @staticmethod
     def _send_text_direct(root, content: str) -> bool:
@@ -1897,24 +2525,277 @@ class WeChatGroupListener:
             logger.debug("直接坐标发送失败: %s", exc)
             return False
 
+    @staticmethod
+    def _log_control_rect(prefix: str, control, group: str, attempt: int) -> None:
+        try:
+            rect = control.BoundingRectangle
+            logger.info(
+                "%s: group=%s attempt=%s name=%r auto_id=%r class=%r type=%r rect=(%s,%s,%s,%s)",
+                prefix,
+                group,
+                attempt,
+                _safe_text(control, "Name")[:120],
+                _safe_text(control, "AutomationId"),
+                _safe_text(control, "ClassName"),
+                _safe_text(control, "ControlTypeName"),
+                getattr(rect, "left", None),
+                getattr(rect, "top", None),
+                getattr(rect, "right", None),
+                getattr(rect, "bottom", None),
+            )
+        except Exception as exc:
+            logger.debug("%s日志失败: group=%s attempt=%s error=%s", prefix, group, attempt, exc)
+
+    @staticmethod
+    def _log_send_surface(root, group: str, attempt: int, phase: str) -> None:
+        try:
+            root_rect = root.BoundingRectangle
+            msg_list = _find_message_list(root)
+            edit = WeChatGroupListener._find_chat_input(root)
+            button = WeChatGroupListener._find_send_button(root)
+            logger.info(
+                "发送表面检查: group=%s attempt=%s phase=%s root_rect=(%s,%s,%s,%s) "
+                "msg_list=%s input=%s send_button=%s root_name=%r",
+                group,
+                attempt,
+                phase,
+                getattr(root_rect, "left", None),
+                getattr(root_rect, "top", None),
+                getattr(root_rect, "right", None),
+                getattr(root_rect, "bottom", None),
+                bool(msg_list),
+                bool(edit),
+                bool(button),
+                _safe_text(root, "Name")[:120],
+            )
+        except Exception as exc:
+            logger.debug(
+                "发送表面检查失败: group=%s attempt=%s phase=%s error=%s",
+                group,
+                attempt,
+                phase,
+                exc,
+            )
+
+    @staticmethod
+    def _focus_chat_input(
+        root,
+        edit,
+        group: str,
+        attempt: int,
+        *,
+        send_id: str = "",
+        reply: str = "",
+    ) -> bool:
+        """把焦点明确放到当前群的聊天输入框，失败则禁止粘贴。"""
+        started_at = time.time()
+        WeChatGroupListener._log_send_stage(
+            "focus_input_start",
+            group=group,
+            send_id=send_id,
+            attempt=attempt,
+            reply=reply,
+        )
+        try:
+            try:
+                hwnd = platform.window_manager.find_wechat_window()
+                if hwnd:
+                    platform.window_manager.bring_to_front(hwnd)
+            except Exception as exc:
+                logger.debug("发送前置前微信失败: group=%s attempt=%s error=%s", group, attempt, exc)
+
+            edit_rect = edit.BoundingRectangle
+            root_rect = root.BoundingRectangle
+            if not edit_rect or not root_rect:
+                logger.warning("输入框聚焦失败: group=%s attempt=%s reason=rect_missing", group, attempt)
+                WeChatGroupListener._log_send_stage(
+                    "focus_input_done",
+                    group=group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=False,
+                    reason="rect_missing",
+                    elapsed_ms=int((time.time() - started_at) * 1000),
+                    reply=reply,
+                )
+                return False
+            if edit_rect.top < root_rect.top + root_rect.height * 0.55:
+                logger.warning(
+                    "输入框聚焦失败: group=%s attempt=%s reason=input_not_in_bottom rect=(%s,%s,%s,%s)",
+                    group,
+                    attempt,
+                    edit_rect.left,
+                    edit_rect.top,
+                    edit_rect.right,
+                    edit_rect.bottom,
+                )
+                WeChatGroupListener._log_send_stage(
+                    "focus_input_done",
+                    group=group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=False,
+                    reason="input_not_in_bottom",
+                    elapsed_ms=int((time.time() - started_at) * 1000),
+                    reply=reply,
+                )
+                return False
+
+            x = int((edit_rect.left + edit_rect.right) / 2)
+            y = int((edit_rect.top + edit_rect.bottom) / 2)
+            logger.info(
+                "点击聊天输入框: group=%s attempt=%s x=%s y=%s",
+                group,
+                attempt,
+                x,
+                y,
+            )
+            platform.input.mouse_click(x, y)
+            time.sleep(SEND_FOCUS_SETTLE_SECONDS)
+
+            try:
+                edit.SetFocus()
+                time.sleep(SEND_FOCUS_SETTLE_SECONDS)
+            except Exception as exc:
+                logger.debug("输入框 SetFocus 失败: group=%s attempt=%s error=%s", group, attempt, exc)
+
+            focused = None
+            try:
+                focused = platform.automation.get_focused_control()
+            except Exception as exc:
+                logger.debug("读取当前焦点失败: group=%s attempt=%s error=%s", group, attempt, exc)
+
+            if not focused:
+                logger.info("输入框焦点无法读取，已完成坐标点击: group=%s attempt=%s", group, attempt)
+                WeChatGroupListener._log_send_stage(
+                    "focus_input_done",
+                    group=group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=True,
+                    reason="focused_unreadable_after_click",
+                    elapsed_ms=int((time.time() - started_at) * 1000),
+                    reply=reply,
+                )
+                return True
+
+            WeChatGroupListener._log_control_rect("发送前当前焦点", focused, group, attempt)
+            focused_rect = focused.BoundingRectangle
+            if WeChatGroupListener._rects_overlap(edit_rect, focused_rect, min_ratio=0.2):
+                WeChatGroupListener._log_send_stage(
+                    "focus_input_done",
+                    group=group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=True,
+                    reason="focused_input",
+                    elapsed_ms=int((time.time() - started_at) * 1000),
+                    reply=reply,
+                )
+                return True
+
+            logger.warning(
+                "输入框聚焦失败: group=%s attempt=%s reason=focused_elsewhere "
+                "focused_name=%r focused_auto_id=%r",
+                group,
+                attempt,
+                _safe_text(focused, "Name")[:120],
+                _safe_text(focused, "AutomationId"),
+            )
+            WeChatGroupListener._log_send_stage(
+                "focus_input_done",
+                group=group,
+                send_id=send_id,
+                attempt=attempt,
+                success=False,
+                reason="focused_elsewhere",
+                elapsed_ms=int((time.time() - started_at) * 1000),
+                reply=reply,
+                focused_name=_safe_text(focused, "Name")[:120],
+                focused_auto_id=_safe_text(focused, "AutomationId"),
+            )
+            return False
+        except Exception as exc:
+            logger.warning("输入框聚焦异常: group=%s attempt=%s error=%s", group, attempt, exc)
+            WeChatGroupListener._log_send_stage(
+                "focus_input_done",
+                group=group,
+                send_id=send_id,
+                attempt=attempt,
+                success=False,
+                reason="exception",
+                elapsed_ms=int((time.time() - started_at) * 1000),
+                reply=reply,
+                error=str(exc),
+            )
+            return False
+
+    @staticmethod
+    def _rects_overlap(a, b, *, min_ratio: float = 0.1) -> bool:
+        if not a or not b:
+            return False
+        left = max(a.left, b.left)
+        top = max(a.top, b.top)
+        right = min(a.right, b.right)
+        bottom = min(a.bottom, b.bottom)
+        if right <= left or bottom <= top:
+            return False
+        intersection = (right - left) * (bottom - top)
+        area = max(1, (b.right - b.left) * (b.bottom - b.top))
+        return intersection / area >= min_ratio
+
     def _verify_reply_visible(
         self,
         session: _ListenSession,
         content: str,
         timeout: float = 5.0,
+        send_id: str = "",
+        attempt: int = 0,
     ) -> bool:
         """确认回复已出现在当前聊天气泡中。"""
         expected = _normalize_message_text(content)
         if not expected:
             return False
 
+        started_at = time.time()
+        self._log_send_stage(
+            "verify_start",
+            group=session.group,
+            send_id=send_id,
+            attempt=attempt,
+            reply=content,
+            timeout=timeout,
+        )
         self._last_verify_closed_detached = False
         deadline = time.time() + min(timeout, SEND_VERIFY_TIMEOUT)
         while time.time() < deadline:
-            if _dismiss_send_failure_dialog(session.root):
+            failure_check_started_at = time.time()
+            failure_dialog = _dismiss_send_failure_dialog(session.root)
+            self._log_send_stage(
+                "failure_dialog_checked",
+                group=session.group,
+                send_id=send_id,
+                attempt=attempt,
+                success=not failure_dialog,
+                reason="found" if failure_dialog else "not_found",
+                elapsed_ms=int((time.time() - failure_check_started_at) * 1000),
+                reply=content,
+                phase="verify",
+            )
+            if failure_dialog:
                 log_error_audit(
                     "wechat_send_failure_dialog",
                     {"group": session.group, "reply": content},
+                )
+                self._log_send_stage(
+                    "verify_done",
+                    group=session.group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=False,
+                    reason="wechat_send_failure_dialog",
+                    elapsed_ms=int((time.time() - started_at) * 1000),
+                    reply=content,
                 )
                 return False
             _, _, current_detached, _ = self._get_send_state()
@@ -1924,12 +2805,52 @@ class WeChatGroupListener:
                     session.root = detached_root
                     self._last_verify_closed_detached = True
                     logger.warning("发送后快速检测到目标群独立窗口，改用独立窗口重发: %s", session.group)
+                    self._log_send_stage(
+                        "verify_done",
+                        group=session.group,
+                        send_id=send_id,
+                        attempt=attempt,
+                        success=False,
+                        reason="detached_window_detected",
+                        elapsed_ms=int((time.time() - started_at) * 1000),
+                        reply=content,
+                    )
                     return False
             if self._reply_visible_in_root(session.root, expected):
+                self._log_send_stage(
+                    "verify_done",
+                    group=session.group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=True,
+                    reason="reply_visible",
+                    elapsed_ms=int((time.time() - started_at) * 1000),
+                    reply=content,
+                )
                 return True
             if self._stop_event.wait(0.15):
+                self._log_send_stage(
+                    "verify_done",
+                    group=session.group,
+                    send_id=send_id,
+                    attempt=attempt,
+                    success=False,
+                    reason="stopped",
+                    elapsed_ms=int((time.time() - started_at) * 1000),
+                    reply=content,
+                )
                 return False
 
+        self._log_send_stage(
+            "verify_done",
+            group=session.group,
+            send_id=send_id,
+            attempt=attempt,
+            success=False,
+            reason="timeout",
+            elapsed_ms=int((time.time() - started_at) * 1000),
+            reply=content,
+        )
         return False
 
     @staticmethod
@@ -1948,9 +2869,35 @@ class WeChatGroupListener:
                 return True
         return False
 
-    def _activate_group_for_send(self, session: _ListenSession) -> bool:
+    def _activate_group_for_send(
+        self,
+        session: _ListenSession,
+        *,
+        send_id: str = "",
+        send_attempt: int = 0,
+    ) -> bool:
+        """确保发送前目标群处于前台。
+
+        发送链路中有三个容易误判的地方：
+        1. _fetch_quote_from_chat 可能已经为了读取引用/图片点击过目标群。
+           如果这里再点击左侧当前会话，微信 4.x 会把右侧聊天区域置为空白。
+           因此先检查 _send_state 中的 recent_target_selected，命中则直接复用。
+        2. 不读取左侧 ListItem.IsSelected。该 AX 属性在 macOS 微信上会偶发
+           阻塞或返回不稳定结果，不能作为发送热路径的判断依据。
+        3. 点击目标群后不在本阶段扫描消息列表/输入框。聊天区 AX 查询也可能
+           卡住；本阶段只负责切群，输入框定位交给 _send_text_via_chat_input
+           并通过 input_* 日志观察。
+        """
         last_reason = "no_window"
         for attempt in range(1, GROUP_SWITCH_ATTEMPT_LIMIT + 1):
+            attempt_started_at = time.time()
+            self._log_send_stage(
+                "activate_start",
+                group=session.group,
+                send_id=send_id,
+                attempt=send_attempt,
+                switch_attempt=attempt,
+            )
             if self._stop_event.is_set():
                 return False
             if attempt > 1:
@@ -1960,20 +2907,30 @@ class WeChatGroupListener:
                     attempt=attempt,
                 )
 
-            # 原子读取当前发送状态快照
-            current_group, current_group_at, _, _ = self._get_send_state()
-            if (
-                current_group == session.group
-                and time.time() - current_group_at <= 180
-            ):
-                root = session.root or self._get_main_root()
-                if root:
-                    session.root = root
-                    self._set_send_state(detached=False)
-                    logger.info("复用当前群窗口直接发送: group=%s", session.group)
-                    return True
-
+            logger.info(
+                "发送前切群开始: group=%s attempt=%s/%s",
+                session.group,
+                attempt,
+                GROUP_SWITCH_ATTEMPT_LIMIT,
+            )
             detached_root = _get_detached_group_root(session.group)
+            detached_elapsed_ms = int((time.time() - attempt_started_at) * 1000)
+            logger.info(
+                "发送前独立窗口检查: group=%s attempt=%s found=%s elapsed=%.3fs",
+                session.group,
+                attempt,
+                bool(detached_root),
+                time.time() - attempt_started_at,
+            )
+            self._log_send_stage(
+                "activate_detached_checked",
+                group=session.group,
+                send_id=send_id,
+                attempt=send_attempt,
+                success=bool(detached_root),
+                elapsed_ms=detached_elapsed_ms,
+                switch_attempt=attempt,
+            )
             if detached_root:
                 detached_msg_list = _find_message_list(detached_root)
                 detached_edit = self._find_chat_input(detached_root)
@@ -1988,25 +2945,128 @@ class WeChatGroupListener:
                         "detached_window_used_for_send",
                         {"group": session.group, "attempt": attempt},
                     )
+                    self._log_send_stage(
+                        "activate_done",
+                        group=session.group,
+                        send_id=send_id,
+                        attempt=send_attempt,
+                        success=True,
+                        reason="detached_window_ready",
+                        elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                        switch_attempt=attempt,
+                    )
                     return True
 
+            root_started_at = time.time()
             root = self._get_main_root()
+            root_elapsed_ms = int((time.time() - root_started_at) * 1000)
+            logger.info(
+                "发送前主窗口检查: group=%s attempt=%s root=%s elapsed=%.3fs total=%.3fs",
+                session.group,
+                attempt,
+                bool(root),
+                time.time() - root_started_at,
+                time.time() - attempt_started_at,
+            )
+            self._log_send_stage(
+                "activate_main_root_checked",
+                group=session.group,
+                send_id=send_id,
+                attempt=send_attempt,
+                success=bool(root),
+                reason="" if root else "main_root_missing",
+                elapsed_ms=root_elapsed_ms,
+                total_ms=int((time.time() - attempt_started_at) * 1000),
+                switch_attempt=attempt,
+            )
             if not root:
                 last_reason = "main_root_missing"
                 continue
 
             session.root = root
-            _dismiss_send_failure_dialog(root)
+            try:
+                root.SendKeys("{Esc}")
+            except Exception:
+                pass
 
             try:
-                # 优先使用缓存的会话项引用
-                item = None
-                if (
+                current_group, current_group_at, current_detached, _ = self._get_send_state()
+                # 优先复用“读取消息阶段刚刚打开过目标群”的状态。这是防止
+                # 二次点击当前会话导致右侧空白的核心保护。
+                recent_target_selected = (
+                    current_group == session.group
+                    and not current_detached
+                    and time.time() - current_group_at <= 90.0
+                )
+                self._log_send_stage(
+                    "activate_state_checked",
+                    group=session.group,
+                    send_id=send_id,
+                    attempt=send_attempt,
+                    success=recent_target_selected,
+                    reason="recent_target_selected" if recent_target_selected else "not_recent_target",
+                    elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                    switch_attempt=attempt,
+                    current_group=current_group or "",
+                    state_age_ms=int((time.time() - current_group_at) * 1000) if current_group_at else None,
+                )
+                if recent_target_selected:
+                    # 引用/图片读取阶段可能刚刚点击过目标群。macOS 微信 4.x
+                    # 对当前左侧会话再次点击会让右侧聊天区进入空白态，所以这里
+                    # 直接复用最近一次明确切到目标群的状态。
+                    session.root = root
+                    logger.info(
+                        "发送前复用最近已打开目标群，跳过左侧点击: group=%s attempt=%s age=%.3fs",
+                        session.group,
+                        attempt,
+                        time.time() - current_group_at,
+                    )
+                    self._log_send_stage(
+                        "activate_done",
+                        group=session.group,
+                        send_id=send_id,
+                        attempt=send_attempt,
+                        success=True,
+                        reason="recent_target_selected",
+                        elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                        switch_attempt=attempt,
+                    )
+                    return True
+
+                item_lookup_started_at = time.time()
+                current_selected_item = _find_session_item(root, session.group)
+                self._log_send_stage(
+                    "activate_session_item_checked",
+                    group=session.group,
+                    send_id=send_id,
+                    attempt=send_attempt,
+                    success=bool(current_selected_item),
+                    elapsed_ms=int((time.time() - item_lookup_started_at) * 1000),
+                    switch_attempt=attempt,
+                )
+                title_matches = _current_chat_title_matches(root, session.group)
+                self._log_send_stage(
+                    "activate_title_checked",
+                    group=session.group,
+                    send_id=send_id,
+                    attempt=send_attempt,
+                    success=title_matches,
+                    elapsed_ms=int((time.time() - item_lookup_started_at) * 1000),
+                    switch_attempt=attempt,
+                )
+
+                # 只有 recent_target_selected 和右侧标题都没命中时，才准备点击
+                # 左侧会话。优先使用本轮可见列表中找到的控件，缓存只作为找不到
+                # 可见项时的回退；缓存不能证明当前会话已选中。
+                item = current_selected_item
+                item_from_cache = False
+                if not item and (
                     session.cached_session_item
                     and time.time() - session.cached_session_item_at <= _SESSION_ITEM_CACHE_TTL
                 ):
                     if self._validate_control_cache(session.cached_session_item):
                         item = session.cached_session_item
+                        item_from_cache = True
                 if not item:
                     item = _find_session_item(root, session.group)
                     if item:
@@ -2020,71 +3080,121 @@ class WeChatGroupListener:
                         GROUP_SWITCH_ATTEMPT_LIMIT,
                         session.group,
                     )
+                    self._log_send_stage(
+                        "activate_session_item_missing",
+                        group=session.group,
+                        send_id=send_id,
+                        attempt=send_attempt,
+                        success=False,
+                        reason=last_reason,
+                        elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                        switch_attempt=attempt,
+                    )
                     continue
 
-                selected_before = False
-                try:
-                    selected_before = bool(item.IsSelected)
-                except Exception:
-                    pass
+                # 发送热路径不读取 ListItem.IsSelected。macOS 微信 AX 在该属性上
+                # 偶发卡住；右侧标题才是是否已打开目标群的强判断。标题命中时
+                # 必须跳过左侧点击，否则会触发“当前会话二次点击 -> 聊天区空白”。
+                selected_before = title_matches
 
-                # 重新读取状态，检查是否已被选中
-                current_group_check, _, _, _ = self._get_send_state()
-                if selected_before or current_group_check == session.group:
-                    self._set_send_state(
-                        group=session.group, group_at=time.time(), detached=False
-                    )
-                    return True
-
-                if not _click_session_item(item):
-                    last_reason = "session_item_click_failed"
-                    logger.warning(
-                        "切群尝试 %s/%s 点击会话失败: %s",
-                        attempt,
-                        GROUP_SWITCH_ATTEMPT_LIMIT,
+                if selected_before:
+                    logger.info(
+                        "发送前目标群已打开，跳过左侧点击: group=%s attempt=%s title_match=%s",
                         session.group,
+                        attempt,
+                        title_matches,
                     )
-                    continue
-
-                wait_deadline = time.time() + GROUP_SWITCH_WAIT_SECONDS
-                clicked_at = time.time()
-                detached_checked_after_click = False
-                while time.time() < wait_deadline:
-                    if self._stop_event.wait(0.12):
-                        return False
-                    now = time.time()
-                    if not detached_checked_after_click and now - clicked_at >= DETACHED_WINDOW_CHECK_INTERVAL:
-                        detached_checked_after_click = True
-                        detached_root = _get_detached_group_root(session.group)
-                        if detached_root:
-                            detached_msg_list = _find_message_list(detached_root)
-                            detached_edit = self._find_chat_input(detached_root)
-                            if detached_msg_list and detached_edit:
-                                session.root = detached_root
-                                session.msg_list = detached_msg_list
-                                self._set_send_state(
-                                    group=session.group, group_at=time.time(), detached=True
-                                )
-                                logger.warning("会话点击打开了独立窗口，改用独立窗口发送: %s", session.group)
-                                log_error_audit(
-                                    "detached_window_used_for_send",
-                                    {"group": session.group, "attempt": attempt, "after_click": True},
-                                )
-                                return True
-
-                    if now - clicked_at >= GROUP_SWITCH_FALLBACK_ACCEPT_SECONDS:
-                        # 发送前不查输入框控件，避免 AX 查询卡住；发送动作会直接
-                        # 点击底部输入区并粘贴。
-                        session.root = root
-                        logger.info(
-                            "切群后直接发送: group=%s, attempt=%s",
-                            session.group,
+                    self._log_send_stage(
+                        "activate_click_skipped",
+                        group=session.group,
+                        send_id=send_id,
+                        attempt=send_attempt,
+                        success=True,
+                        reason="title_matches",
+                        elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                        switch_attempt=attempt,
+                    )
+                else:
+                    self._log_send_stage(
+                        "activate_click_start",
+                        group=session.group,
+                        send_id=send_id,
+                        attempt=send_attempt,
+                        success=None,
+                        reason="title_not_matched",
+                        elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                        switch_attempt=attempt,
+                        item_from_cache=item_from_cache,
+                    )
+                    click_started_at = time.time()
+                    if not _click_session_item(item):
+                        last_reason = "session_item_click_failed"
+                        logger.warning(
+                            "切群尝试 %s/%s 点击会话失败: %s",
                             attempt,
+                            GROUP_SWITCH_ATTEMPT_LIMIT,
+                            session.group,
                         )
-                        self._set_send_state(
-                            group=session.group, group_at=time.time(), detached=False
+                        self._log_send_stage(
+                            "activate_click_done",
+                            group=session.group,
+                            send_id=send_id,
+                            attempt=send_attempt,
+                            success=False,
+                            reason=last_reason,
+                            elapsed_ms=int((time.time() - click_started_at) * 1000),
+                            total_ms=int((time.time() - attempt_started_at) * 1000),
+                            switch_attempt=attempt,
+                            item_from_cache=item_from_cache,
                         )
-                        return True
+                        continue
+                    self._log_send_stage(
+                        "activate_click_done",
+                        group=session.group,
+                        send_id=send_id,
+                        attempt=send_attempt,
+                        success=True,
+                        reason="clicked",
+                        elapsed_ms=int((time.time() - click_started_at) * 1000),
+                        total_ms=int((time.time() - attempt_started_at) * 1000),
+                        switch_attempt=attempt,
+                        item_from_cache=item_from_cache,
+                    )
+                    logger.info("发送前已点击目标群: group=%s attempt=%s", session.group, attempt)
+                    self._set_send_state(group=session.group, group_at=time.time(), detached=False)
+                    session.cached_session_item = item
+                    session.cached_session_item_at = time.time()
+
+                # 发送前切群阶段只负责把目标会话带到前台，不再扫描消息列表/输入框。
+                # macOS 微信 AX 在聊天区控件树查询上会偶发卡住；输入框定位交给
+                # _send_text_via_chat_input，并由 input_* 阶段日志记录成败。这里返回
+                # True 表示“已完成切群动作或已确认无需切群”，不表示消息已经发送。
+                settle_seconds = 0.12 if selected_before else GROUP_SWITCH_FALLBACK_ACCEPT_SECONDS
+                if self._stop_event.wait(settle_seconds):
+                    return False
+                try:
+                    session.root = self._get_main_root() or root
+                except Exception:
+                    session.root = root
+                self._set_send_state(group=session.group, group_at=time.time(), detached=False)
+                logger.info(
+                    "发送前目标群切换完成，进入输入阶段: group=%s attempt=%s selected_before=%s",
+                    session.group,
+                    attempt,
+                    selected_before,
+                )
+                self._log_send_stage(
+                    "activate_done",
+                    group=session.group,
+                    send_id=send_id,
+                    attempt=send_attempt,
+                    success=True,
+                    reason="target_selected_assumed_ready",
+                    elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                    switch_attempt=attempt,
+                    selected_before=selected_before,
+                )
+                return True
             except Exception as exc:
                 last_reason = f"attempt_failed:{exc}"
                 logger.warning(
@@ -2094,12 +3204,49 @@ class WeChatGroupListener:
                     session.group,
                     exc,
                 )
+                self._log_send_stage(
+                    "activate_attempt_failed",
+                    group=session.group,
+                    send_id=send_id,
+                    attempt=send_attempt,
+                    success=False,
+                    reason=last_reason,
+                    elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                    switch_attempt=attempt,
+                    error=str(exc),
+                )
                 continue
+
+            logger.warning(
+                "发送前切群尝试未就绪: group=%s attempt=%s reason=%s elapsed=%.3fs",
+                session.group,
+                attempt,
+                last_reason,
+                time.time() - attempt_started_at,
+            )
+            self._log_send_stage(
+                "activate_attempt_failed",
+                group=session.group,
+                send_id=send_id,
+                attempt=send_attempt,
+                success=False,
+                reason=last_reason,
+                elapsed_ms=int((time.time() - attempt_started_at) * 1000),
+                switch_attempt=attempt,
+            )
 
         logger.error(f"发送前切换目标群最终失败: {session.group}, reason={last_reason}")
         log_error_audit(
             "activate_group_failed",
             {"group": session.group, "reason": last_reason},
+        )
+        self._log_send_stage(
+            "activate_done",
+            group=session.group,
+            send_id=send_id,
+            attempt=send_attempt,
+            success=False,
+            reason=last_reason,
         )
         return False
 
@@ -2134,3 +3281,33 @@ class WeChatGroupListener:
             return None
         candidates.sort(key=lambda item: item[0], reverse=True)
         return candidates[0][1]
+
+    @staticmethod
+    def _find_send_button(root):
+        if not root:
+            return None
+        candidates = []
+        try:
+            root_rect = root.BoundingRectangle
+            for control, _depth in platform.automation.walk_control(root, include_top=True, max_depth=8):
+                control_type = _safe_text(control, "ControlTypeName")
+                name = _safe_text(control, "Name").strip()
+                auto_id = _safe_text(control, "AutomationId").strip()
+                if control_type != "ButtonControl" and "Button" not in control_type:
+                    continue
+                if name not in {"发送", "Send"} and auto_id not in {"send_button", "btn_send"}:
+                    continue
+                rect = control.BoundingRectangle
+                if rect.top < root_rect.top + root_rect.height * 0.55:
+                    continue
+                if rect.left < root_rect.left + root_rect.width * 0.45:
+                    continue
+                area = max(1, (rect.right - rect.left) * (rect.bottom - rect.top))
+                candidates.append((rect.top, rect.left, area, control))
+        except Exception:
+            return None
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return candidates[0][3]

@@ -25,9 +25,9 @@ label{display:block;font-size:.85rem;font-weight:600;color:var(--text);margin-bo
 .hint{font-size:.75rem;color:var(--text-secondary);margin-top:4px}
 input,select,textarea{width:100%;padding:9px 12px;border:1px solid var(--border);border-radius:8px;font-size:.9rem;background:#fff;transition:.15s}
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(79,68,229,.1)}
-input.error,select.error{border-color:var(--danger)}
+input.error,select.error,textarea.error{border-color:var(--danger)}
 .error-text{color:var(--danger);font-size:.75rem;margin-top:4px;display:none}
-input.error+.error-text,.form-group:has(input.error) .error-text{display:block}
+input.error+.error-text,textarea.error+.error-text,.form-group:has(input.error) .error-text,.form-group:has(textarea.error) .error-text{display:block}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .tag-input{display:flex;flex-wrap:wrap;gap:6px;padding:6px;border:1px solid var(--border);border-radius:8px;background:#fff;align-items:center}
 .tag-input:focus-within{border-color:var(--primary);box-shadow:0 0 0 3px rgba(79,68,229,.1)}
@@ -113,6 +113,18 @@ input.error+.error-text,.form-group:has(input.error) .error-text{display:block}
           <div class="tag-input" id="groupsInput"><input placeholder="输入群名后按回车添加" /></div>
           <p class="hint">只监听这里列出的群聊，至少添加一个</p>
           <p class="error-text" id="err-groups"></p>
+        </div>
+        <div class="form-group">
+          <label>机器人昵称</label>
+          <input type="text" id="botNickname" placeholder="例如：豆角" />
+          <p class="hint">用于识别当前打开群聊中的 @昵称；建议填写，避免启动时读取头像资料卡。</p>
+          <p class="error-text" id="err-botNickname"></p>
+        </div>
+        <div class="form-group">
+          <label>按群昵称覆盖（JSON，可选）</label>
+          <textarea id="groupNicknames" rows="4" placeholder='{"项目测试":"豆角"}'></textarea>
+          <p class="hint">群里昵称不一致时填写，格式为 {"群名":"机器人昵称"}。</p>
+          <p class="error-text" id="err-groupNicknames"></p>
         </div>
         <div class="row">
           <div class="form-group">
@@ -485,6 +497,8 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 /* ---------- Load / Collect ---------- */
 function loadConfig(cfg) {
   groupsTags.set(Array.isArray(cfg.groups) ? cfg.groups : []);
+  document.getElementById('botNickname').value = cfg.bot_nickname ?? '';
+  document.getElementById('groupNicknames').value = JSON.stringify(cfg.group_nicknames || {}, null, 2);
   const delay = cfg.reply_delay_range || [2,5];
   document.getElementById('delayMin').value = delay[0];
   document.getElementById('delayMax').value = delay[1];
@@ -580,8 +594,20 @@ function collectConfig() {
 
   function safeFloat(v) { const n = parseFloat(v); return isNaN(n) ? v : n; }
   function safeInt(v) { const n = parseInt(v, 10); return isNaN(n) ? v : n; }
+  function parseJsonObject(id) {
+    const raw = document.getElementById(id).value.trim();
+    if (!raw) return {};
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : raw;
+    } catch (e) {
+      return raw;
+    }
+  }
   return {
     groups: groupsTags.get(),
+    bot_nickname: document.getElementById('botNickname').value.trim(),
+    group_nicknames: parseJsonObject('groupNicknames'),
     reply_delay_range: [
       safeFloat(document.getElementById('delayMin').value),
       safeFloat(document.getElementById('delayMax').value),
@@ -635,13 +661,14 @@ function showToast(msg, type) {
 
 function clearErrors() {
   document.querySelectorAll('.error-text').forEach(el => { el.textContent = ''; el.style.display = 'none'; });
-  document.querySelectorAll('input, select').forEach(el => el.classList.remove('error'));
+  document.querySelectorAll('input, select, textarea').forEach(el => el.classList.remove('error'));
 }
 
 function showFieldErrors(errors) {
   clearErrors();
   const map = {
-    'groups':'groupsInput','reply_delay_range':'delayMin','ai_queue_size':'aiQueueSize',
+    'groups':'groupsInput','bot_nickname':'botNickname','group_nicknames':'groupNicknames',
+    'reply_delay_range':'delayMin','ai_queue_size':'aiQueueSize',
     'ai_context_size':'aiContextSize','ai_max_reply_chars':'aiMaxReplyChars',
     'default':'defaultProvider','providers':'providersContainer',
     'openclaw.timeout':'ocTimeout','openclaw.prefixes':'ocPrefixesInput',
@@ -663,7 +690,7 @@ function showFieldErrors(errors) {
     if (elId) {
       const el = document.getElementById(elId);
       if (el) {
-        if (el.tagName === 'INPUT' || el.tagName === 'SELECT') el.classList.add('error');
+        if (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA') el.classList.add('error');
         const err = document.getElementById('err-' + elId);
         if (err) { err.textContent = msg; err.style.display = 'block'; }
       }

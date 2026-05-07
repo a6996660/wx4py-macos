@@ -19,6 +19,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from collections import OrderedDict
 from typing import Callable, Iterable, List, Optional, Sequence, Union
@@ -514,7 +515,7 @@ class WeChatGroupProcessor:
         text = (action.content or "").strip()
         if not text:
             return
-        sent = self._listener.reply(action.group, text)
+        sent = self._listener.reply(action.group, text, send_id=uuid.uuid4().hex[:12])
         try:
             log_group_mention_audit(
                 action.group,

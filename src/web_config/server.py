@@ -20,6 +20,8 @@ from urllib.parse import urlparse
 DEFAULT_CONFIG: Dict[str, Any] = {
     "_说明": "wx4py AI 群聊机器人配置",
     "groups": [],
+    "bot_nickname": "",
+    "group_nicknames": {},
     "reply_delay_range": [2, 5],
     "ai_queue_size": 0,
     "ai_context_size": 8,
@@ -232,6 +234,19 @@ def _validate_config(data: Dict[str, Any]) -> Dict[str, str]:
     groups = data.get("groups")
     if not isinstance(groups, list) or not any(str(g).strip() for g in groups):
         errors["groups"] = "至少需要填写一个群聊名称"
+
+    bot_nickname = data.get("bot_nickname", "")
+    if bot_nickname is not None and not isinstance(bot_nickname, str):
+        errors["bot_nickname"] = "机器人昵称必须是文本"
+
+    group_nicknames = data.get("group_nicknames", {})
+    if group_nicknames is not None and not isinstance(group_nicknames, dict):
+        errors["group_nicknames"] = "按群昵称覆盖必须是 JSON 对象"
+    elif isinstance(group_nicknames, dict):
+        for group, nickname in group_nicknames.items():
+            if not str(group).strip() or not isinstance(nickname, str):
+                errors["group_nicknames"] = "按群昵称覆盖格式应为 {\"群名\": \"机器人昵称\"}"
+                break
 
     delay = data.get("reply_delay_range")
     if (

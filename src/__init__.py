@@ -17,6 +17,7 @@ from .openclaw_client import (
     OpenClawResult,
 )
 from .features.messaging.file_monitor import FileMonitorConfig, WeChatDownloadMonitor
+from .features.messaging.image_extractor import WeChatImageExtractor
 from .features.messaging.forwarder import (
     ForwardPayload,
     ForwardRuleHandler,
@@ -67,6 +68,7 @@ __all__ = [
     "WeChatGroupProcessor",
     "FileMonitorConfig",
     "WeChatDownloadMonitor",
+    "WeChatImageExtractor",
     "ForwardTarget",
     "ForwardPayload",
     "GroupForwardRule",

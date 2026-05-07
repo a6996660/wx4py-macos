@@ -408,7 +408,7 @@ def test_hybrid_returns_openclaw_result():
     cfg = OpenClawConfig(enabled=True, prefixes=["/claw"])
     hybrid = HybridResponder(ai_resp, openclaw_client=oc_client, openclaw_config=cfg)
 
-    event = _make_event("@机器人 /claw 生成报告")
+    event = _make_event("@机器人 /claw 生成文件报告")
     result = hybrid(event)
 
     assert isinstance(result, OpenClawResult)
@@ -482,6 +482,23 @@ def test_parse_attachment_from_text():
     assert _parse_attachment_from_text("[照片] 描述", "群A") == (None, "image")
     assert _parse_attachment_from_text("普通文本消息", "群A") == (None, None)
     print("✅ Attachment parse test passed")
+
+
+def test_bare_image_quote_marker():
+    """微信引用图片时气泡内容可能只有裸的“图片”。"""
+    from src.features.messaging.listener import MessageEvent
+
+    event = MessageEvent(
+        group="群A",
+        content="@机器人 /c 分析这张图片",
+        timestamp=0.0,
+        quoted_sender="张三",
+        quoted_content="图片",
+        attachment_type="image",
+    )
+    assert event.quoted_content == "图片"
+    assert event.attachment_type == "image"
+    print("✅ Bare image quote fixture passed")
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +648,44 @@ def test_hybrid_file_downloader_trigger():
     print("✅ HybridResponder test passed: triggers file_downloader when monitor misses")
 
 
+def test_hybrid_image_extractor_trigger():
+    """图片附件应被提取成本地图片路径并传给 OpenClaw。"""
+    from unittest.mock import MagicMock
+    from src.ai import AIResponder
+    from src.openclaw_client import HybridResponder, OpenClawConfig, OpenClawClient, OpenClawResult
+
+    ai_resp = MagicMock(spec=AIResponder)
+    ai_resp.reply_on_at = True
+
+    oc_client = MagicMock(spec=OpenClawClient)
+    oc_client.run_agent_full.return_value = OpenClawResult(
+        text="image analysis done", file_paths=[]
+    )
+
+    image_extractor = MagicMock()
+    image_extractor.extract_latest.return_value = "/tmp/wx-image.png"
+
+    cfg = OpenClawConfig(enabled=True, prefixes=["/claw"], file_support=True)
+    hybrid = HybridResponder(
+        ai_resp,
+        openclaw_client=oc_client,
+        openclaw_config=cfg,
+        image_extractor=image_extractor,
+    )
+
+    event = _make_event("@机器人 /claw 分析这张图片")
+    event = event.__class__(**{**event.__dict__, "attachment_type": "image"})
+
+    result = hybrid(event)
+
+    image_extractor.extract_latest.assert_called_once()
+    oc_client.run_agent_full.assert_called_once()
+    _, kwargs = oc_client.run_agent_full.call_args
+    assert kwargs.get("file_path") == "/tmp/wx-image.png"
+    assert isinstance(result, OpenClawResult)
+    print("✅ HybridResponder test passed: extracts image attachment for OpenClaw")
+
+
 def test_quote_fallback_recent_any_ignored():
     """最近任意引用气泡不能污染当前纯文本消息。"""
     from src.features.messaging.listener import _parse_quote_from_text
@@ -684,6 +739,7 @@ if __name__ == "__main__":
 
     print("\nRunning attachment parse tests...\n")
     test_parse_attachment_from_text()
+    test_bare_image_quote_marker()
     print("\n🎉 Attachment parse test passed!")
 
     print("\nRunning file monitor tests...\n")
@@ -698,7 +754,8 @@ if __name__ == "__main__":
 
     print("\nRunning HybridResponder file downloader trigger tests...\n")
     test_hybrid_file_downloader_trigger()
-    print("\n🎉 HybridResponder file downloader trigger test passed!")
+    test_hybrid_image_extractor_trigger()
+    print("\n🎉 HybridResponder attachment trigger tests passed!")
 
     print("\nRunning quote fallback isolation tests...\n")
     test_quote_fallback_recent_any_ignored()

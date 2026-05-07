@@ -583,6 +583,7 @@ class HybridResponder:
         openclaw_config: Optional[OpenClawConfig] = None,
         file_monitor=None,
         file_downloader=None,
+        image_extractor=None,
         config_path: Optional[Path] = None,
     ):
         self.ai_responder = ai_responder
@@ -590,6 +591,7 @@ class HybridResponder:
         self.openclaw_config = openclaw_config or OpenClawConfig()
         self.file_monitor = file_monitor
         self.file_downloader = file_downloader
+        self.image_extractor = image_extractor
         self._config_path = config_path
         self._session_map: Dict[str, str] = {}
         self.reply_on_at = getattr(ai_responder, "reply_on_at", True)
@@ -638,42 +640,36 @@ class HybridResponder:
                 clean_content[:80],
             )
             file_path: Optional[str] = None
-            if (
-                self.file_monitor is not None
-                and getattr(event, "attachment_name", None)
-            ):
-                resolved = self.file_monitor.resolve(event.attachment_name)
-                if resolved:
-                    file_path = resolved
-                    _hybrid_logger.info(
-                        "附件路径解析: name=%s -> path=%s",
-                        event.attachment_name,
-                        file_path,
-                    )
-                elif self.file_downloader is not None:
-                    _hybrid_logger.info(
-                        "附件未下载，尝试主动触发下载: name=%s",
-                        event.attachment_name,
-                    )
-                    try:
-                        downloaded = self.file_downloader.download(
-                            event.attachment_name
-                        )
-                        if downloaded:
-                            file_path = downloaded
-                            _hybrid_logger.info(
-                                "附件主动下载成功: name=%s -> path=%s",
-                                event.attachment_name,
-                                file_path,
-                            )
-                    except Exception as exc:
-                        _hybrid_logger.warning(
-                            "附件主动下载失败: name=%s, %s",
-                            event.attachment_name,
-                            exc,
-                        )
+            attachment_type = getattr(event, "attachment_type", None)
+            attachment_name = getattr(event, "attachment_name", None)
+            _hybrid_logger.info(
+                "OpenClaw 附件检查: group=%s type=%r name=%r quoted=%r sender=%r",
+                event.group,
+                attachment_type,
+                attachment_name,
+                getattr(event, "quoted_content", None),
+                getattr(event, "sender_nickname", None),
+            )
+            if attachment_type == "image":
+                file_path = self._resolve_image_attachment(event, clean_content)
+            elif attachment_name:
+                file_path = self._resolve_file_attachment(attachment_name)
+            _hybrid_logger.info(
+                "OpenClaw 附件结果: group=%s type=%r name=%r file_path=%r",
+                event.group,
+                attachment_type,
+                attachment_name,
+                file_path,
+            )
 
             try:
+                _hybrid_logger.info(
+                    "OpenClaw 调用准备: group=%s session=%s message=%r file_path=%r",
+                    event.group,
+                    session_id,
+                    clean_content[:120],
+                    file_path,
+                )
                 result = self.openclaw_client.run_agent_full(
                     clean_content,
                     session_id=session_id,
@@ -769,6 +765,71 @@ class HybridResponder:
     # ------------------------------------------------------------------
     # 内部方法
     # ------------------------------------------------------------------
+
+    def _resolve_file_attachment(self, attachment_name: str) -> Optional[str]:
+        """解析或下载微信文件卡片附件。"""
+        if not attachment_name or self.file_monitor is None:
+            return None
+        resolved = self.file_monitor.resolve(attachment_name)
+        if resolved:
+            _hybrid_logger.info(
+                "附件路径解析: name=%s -> path=%s",
+                attachment_name,
+                resolved,
+            )
+            return resolved
+        if self.file_downloader is None:
+            return None
+        _hybrid_logger.info("附件未下载，尝试主动触发下载: name=%s", attachment_name)
+        try:
+            downloaded = self.file_downloader.download(attachment_name)
+            if downloaded:
+                _hybrid_logger.info(
+                    "附件主动下载成功: name=%s -> path=%s",
+                    attachment_name,
+                    downloaded,
+                )
+                return downloaded
+        except Exception as exc:
+            _hybrid_logger.warning("附件主动下载失败: name=%s, %s", attachment_name, exc)
+        return None
+
+    def _resolve_image_attachment(
+        self,
+        event: MessageEvent,
+        clean_content: str,
+    ) -> Optional[str]:
+        """把微信图片气泡提取为本地图片文件。"""
+        if self.image_extractor is None:
+            _hybrid_logger.warning("检测到图片附件，但未配置 image_extractor")
+            return None
+        try:
+            started_at = time.time()
+            _hybrid_logger.info(
+                "图片附件解析开始: group=%s clean=%r sender=%r quoted=%r",
+                event.group,
+                clean_content,
+                event.sender_nickname,
+                event.quoted_content,
+            )
+            image_path = self.image_extractor.extract_latest(
+                event.group,
+                current_content=clean_content,
+                sender_nickname=event.sender_nickname or "",
+            )
+            _hybrid_logger.info(
+                "图片附件解析结束: group=%s ok=%s path=%r elapsed=%.2fs",
+                event.group,
+                bool(image_path),
+                image_path,
+                time.time() - started_at,
+            )
+            if image_path:
+                _hybrid_logger.info("图片附件已提取: path=%s", image_path)
+                return image_path
+        except Exception as exc:
+            _hybrid_logger.warning("图片附件提取失败: group=%s, %s", event.group, exc)
+        return None
 
     def _strip_prefix(self, content: str) -> tuple[bool, str]:
         """检测并去除 OpenClaw 前缀。
