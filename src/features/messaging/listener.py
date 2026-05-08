@@ -180,12 +180,12 @@ def _is_same_outgoing_message(expected: str, actual: str) -> bool:
     if expected == actual:
         return True
 
-    # 微信 UIA 在部分版本上会对长文本、多行文本做轻微归一化或裁剪，
-    # 这里允许“包含关系”命中，避免机器人自己的回复再次触发监听链路。
-    shorter, longer = sorted((expected, actual), key=len)
-    if len(shorter) < 12:
+    # 微信 UIA 在部分版本上会对长文本、多行文本做轻微裁剪。只能接受
+    # “实际气泡是期望回复的前缀”这种情况，不能接受任意包含关系；
+    # 否则长回复可能被输入区残留、历史气泡或相邻文本误判为已发送。
+    if len(actual) < 24:
         return False
-    return shorter in longer
+    return expected.startswith(actual) and len(actual) >= min(80, len(expected))
 
 
 def _safe_text(control, attr: str) -> str:
@@ -803,7 +803,7 @@ def _parse_attachment_from_text(
             )
             continue
 
-        # 去掉可能的发送者前缀，如 "丁某某: [文件] xxx"
+        # 去掉可能的发送者前缀，如 "成员昵称: [文件] xxx"
         content = check_line
         if ":" in content:
             content = content.split(":", 1)[1].strip()
@@ -1287,6 +1287,10 @@ class WeChatGroupListener:
 
             normalized_text = _normalize_message_text(clean_content)
             if normalized_text:
+                # 同一群里不同人可能短时间发送相同 @ 内容，去重必须包含发送人。
+                # 只按内容去重会把第二个人的消息当作重复事件吞掉。
+                dedupe_sender = _normalize_message_text(sender_nickname or "")
+                normalized_key = f"{dedupe_sender}\n{normalized_text}"
                 now = time.time()
                 expired_texts = [
                     text
@@ -1295,10 +1299,16 @@ class WeChatGroupListener:
                 ]
                 for text in expired_texts:
                     session.seen_texts.pop(text, None)
-                if normalized_text in session.seen_texts:
+                if normalized_key in session.seen_texts:
+                    logger.info(
+                        "跳过重复左侧 @ 摘要: group=%s sender=%r content=%r",
+                        session.group,
+                        sender_nickname,
+                        clean_content,
+                    )
                     self._update_next_scan(session, 0)
                     return
-                session.seen_texts[normalized_text] = now
+                session.seen_texts[normalized_key] = now
             if self.ignore_client_sent and self.outgoing_registry.should_ignore(session.group, clean_content):
                 self._update_next_scan(session, 0)
                 return
@@ -2866,6 +2876,12 @@ class WeChatGroupListener:
                 continue
             actual = _normalize_message_text(item.name)
             if _is_same_outgoing_message(expected, actual):
+                logger.info(
+                    "回复可见校验命中: expected_len=%s actual_len=%s actual_preview=%r",
+                    len(expected),
+                    len(actual),
+                    actual[:120],
+                )
                 return True
         return False
 

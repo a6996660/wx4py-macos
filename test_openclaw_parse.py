@@ -691,7 +691,7 @@ def test_quote_fallback_recent_any_ignored():
     from src.features.messaging.listener import _parse_quote_from_text
 
     current_clean = "很好"
-    stale_bubble = "丁某某: [文件] 表单号_10.docx\n@豆角 /c 文件名称序号改成 11 发给我"
+    stale_bubble = "成员昵称: [文件] 表单号_10.docx\n@豆角 /c 文件名称序号改成 11 发给我"
     sender, quoted, remaining = _parse_quote_from_text(stale_bubble)
     assert quoted
     assert current_clean not in stale_bubble

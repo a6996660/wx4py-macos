@@ -20,7 +20,7 @@ description: macOS 微信群 @ AI 自动回复机器人 skill。用于通过 wx4
 ## 前置检查
 
 ```bash
-cd /Volumes/zt/project/wx4py-main
+cd /path/to/wx4py-main
 python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
 ```

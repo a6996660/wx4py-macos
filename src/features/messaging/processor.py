@@ -279,6 +279,7 @@ class AsyncCallbackHandler(CallbackHandler):
 
         key = (
             event.group,
+            (event.sender_nickname or "").strip(),
             self._dedupe_content(event.content),
         )
         if key in self._recent_events:

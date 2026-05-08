@@ -10,9 +10,11 @@ import json
 import os
 import shutil
 import subprocess
+import textwrap
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Deque, Dict, List, Optional, Union
 
 
 class OpenClawError(RuntimeError):
@@ -594,6 +596,7 @@ class HybridResponder:
         self.image_extractor = image_extractor
         self._config_path = config_path
         self._session_map: Dict[str, str] = {}
+        self._group_recent_events: Dict[str, Deque[Dict[str, str]]] = {}
         self.reply_on_at = getattr(ai_responder, "reply_on_at", True)
         self._load_session_map()
 
@@ -610,6 +613,8 @@ class HybridResponder:
         content = AIResponder._strip_at(raw_content, event.group_nickname)
         if not content:
             return ""
+
+        group_context = self._remember_group_event(event, content)
 
         # 处理 session 重置指令（全局，无需 /claw 前缀）
         stripped_lower = content.strip().lower()
@@ -633,10 +638,13 @@ class HybridResponder:
         # ---- OpenClaw 路径 ----
         if use_openclaw:
             session_id = self._get_session_id(event.group)
+            agent_message = self._build_group_agent_message(event, clean_content, group_context)
             _hybrid_logger.info(
-                "OpenClaw 模式: group=%s session=%s content=%s",
+                "OpenClaw 模式: group=%s sender=%s session=%s context_items=%s content=%s",
                 event.group,
+                event.sender_nickname or "",
                 session_id,
+                len(group_context),
                 clean_content[:80],
             )
             file_path: Optional[str] = None
@@ -667,11 +675,11 @@ class HybridResponder:
                     "OpenClaw 调用准备: group=%s session=%s message=%r file_path=%r",
                     event.group,
                     session_id,
-                    clean_content[:120],
+                    agent_message[:240],
                     file_path,
                 )
                 result = self.openclaw_client.run_agent_full(
-                    clean_content,
+                    agent_message,
                     session_id=session_id,
                     file_path=file_path,
                 )
@@ -879,7 +887,7 @@ class HybridResponder:
             _hybrid_logger.warning("保存 session_map 失败: %s", exc)
 
     def _get_session_id(self, group: str) -> Optional[str]:
-        """按群聊生成稳定的 session ID，确保上下文隔离。"""
+        """按会话 key 生成稳定的 session ID，确保上下文隔离。"""
         if not self.openclaw_config.session_per_group:
             return None
         if group not in self._session_map:
@@ -889,8 +897,95 @@ class HybridResponder:
             self._save_session_map()
         return self._session_map[group]
 
+    def _remember_group_event(self, event: MessageEvent, user_message: str) -> List[Dict[str, str]]:
+        """记录群聊最近 @ 上下文，显式传给 OpenClaw。
+
+        不再用“按人 session”硬隔离。群聊里多人可能是在讨论同一个问题，
+        机器人需要能看见最近几条 @ 对话；但每条上下文都标注 sender，
+        由提示词要求模型默认只回答当前发言人，只有当前问题明确要求评判、
+        总结或对比多人观点时才综合群上下文。
+        """
+        group = str(event.group or "").strip()
+        sender = str(event.sender_nickname or "").strip() or "未知成员"
+        if group not in self._group_recent_events:
+            self._group_recent_events[group] = deque(maxlen=8)
+        history = self._group_recent_events[group]
+        history.append(
+            {
+                "sender": sender,
+                "message": str(user_message or "").strip(),
+            }
+        )
+        return list(history)
+
+    @staticmethod
+    def _build_group_agent_message(
+        event: MessageEvent,
+        user_message: str,
+        group_context: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        """为 OpenClaw 构造群聊机器人上下文提示。
+
+        这不是系统消息，但 OpenClaw CLI 当前只暴露 message 参数。把群聊
+        元信息和约束放进 message，避免模型把其他群成员的历史上下文当成
+        当前发言人的语境，同时保留多人讨论同一个问题时的可用上下文。
+        """
+        group = str(event.group or "").strip() or "未知群聊"
+        sender = str(event.sender_nickname or "").strip() or "未知成员"
+        bot_name = str(event.group_nickname or "").strip() or "机器人"
+        quoted_sender = str(getattr(event, "quoted_sender", "") or "").strip()
+        quoted_content = str(getattr(event, "quoted_content", "") or "").strip()
+
+        quote_block = ""
+        if quoted_content:
+            quote_block = textwrap.dedent(
+                f"""
+                当前消息引用了群内历史内容：
+                - 被引用发言人：{quoted_sender or "未知"}
+                - 被引用内容：{quoted_content}
+                """
+            ).strip()
+        else:
+            quote_block = "当前消息没有显式引用其他群成员的发言。"
+
+        context_lines = []
+        for idx, item in enumerate(group_context or [], start=1):
+            ctx_sender = str(item.get("sender") or "未知成员").strip()
+            ctx_msg = str(item.get("message") or "").strip()
+            if not ctx_msg:
+                continue
+            context_lines.append(f"{idx}. {ctx_sender}: {ctx_msg}")
+        context_block = "\n".join(context_lines) if context_lines else "无"
+
+        return textwrap.dedent(
+            f"""
+            你正在作为微信群聊机器人“{bot_name}”回复消息。
+
+            群聊名称：{group}
+            当前发言人：{sender}
+            当前回复对象：只回复“{sender}”
+
+            重要约束：
+            1. 只回答当前发言人“{sender}”这条消息里的请求。
+            2. 不要把其他群成员的历史问题当成“{sender}”的问题。
+            3. 下面的“最近群聊 @ 上下文”只作为参考。默认优先使用当前发言人“{sender}”自己的上下文。
+            4. 只有当前消息明确要求你评判、总结、比较多人观点，或明确引用了他人发言时，才综合其他群成员的上下文。
+            5. 如果当前消息是“为什么不理我”“继续”“这个呢”等短句，先按当前发言人自己的最近上下文理解；不要自动延续其他人的话题。
+            6. 回复必须面向“{sender}”，不要替其他群成员延续话题。
+            7. 这是群聊场景，多个成员可能连续 @ 机器人；每条消息都要按发言人和显式引用独立判断语境。
+
+            {quote_block}
+
+            最近群聊 @ 上下文（每条都标注了发言人，越靠后越新）：
+            {context_block}
+
+            当前发言人的原始消息：
+            {user_message}
+            """
+        ).strip()
+
     def _reset_session(self, group: str) -> None:
-        """重置指定群聊的 session，生成全新随机 ID 并清理 OpenClaw 端 session 文件。"""
+        """重置指定 session key 的 session，生成全新随机 ID 并清理 OpenClaw 端 session 文件。"""
         old_session: Optional[str] = None
         if group in self._session_map:
             old_session = self._session_map.pop(group)
