@@ -19,10 +19,22 @@
   "_ai_context_size_说明": "同一个群传给大模型的最近上下文消息数。上下文会带发送人，例如：张三说: 你好。",
   "ai_max_reply_chars": 180,
   "_ai_max_reply_chars_说明": "单条自动回复目标最大字符数。会写入模型提示词让模型自然控制长度，程序仅做极端兜底；建议 80-220，越短越像微信聊天。",
+  "system_prompt": "",
+  "_system_prompt_说明": "全局默认系统提示词。留空或删除该字段时使用代码内置默认提示词。填写后，所有未单独设置系统提示词的 Provider 都会继承此内容。可在 Web 配置页面的基础设置中编辑，也可在每个 Provider 中单独覆盖。",
   "group_log_root": "logs/group_mentions",
   "_group_log_root_说明": "群聊 @ 自动回复审计日志目录。程序会按日期建子目录，并按群名单独写 log 文件。",
   "error_log_root": "logs/errors",
   "_error_log_root_说明": "关键错误日志目录。reply_failed、切群失败、AI 调用异常等会按日期写入这里。",
+  "web_search": {
+    "_说明": "LLM 回复路径下的网络插件。启用后遇到天气、新闻、股价等实时问题会先搜索网络信息，再交给 LLM 总结。仅 LLM 模式和双引擎的普通 LLM 消息可用；OpenClaw 路径不会使用此插件。",
+    "enabled": false,
+    "provider": "baidu",
+    "api_key": "",
+    "_api_key_说明": "百度千帆 AI Search API Key。留空时读取环境变量 BAIDU_API_KEY。",
+    "count": 5,
+    "timeout": 10,
+    "auto_detect": true
+  },
   "default": "ark",
   "_default_说明": "默认使用 providers 中的哪个模型服务配置。",
   "providers": {
@@ -34,7 +46,9 @@
       "api_key": "replace-with-your-ark-api-key",
       "temperature": 0.7,
       "max_tokens": 220,
-      "timeout": 20
+      "timeout": 20,
+      "system_prompt": "",
+      "_system_prompt_说明": "自定义系统提示词。留空或删除该字段时继承全局默认或代码内置提示词。填写后可控制回复风格、身份边界、事实边界等。"
     }
   },
   "openclaw": {

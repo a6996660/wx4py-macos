@@ -33,7 +33,9 @@ from src import (
     HybridResponder,
     OpenClawClient,
     OpenClawConfig,
+    SearchAugmentor,
     WeChatClient,
+    WebSearchConfig,
 )
 from src.features.messaging.file_monitor import (
     FileMonitorConfig,
@@ -201,6 +203,11 @@ def _load_file_monitor_config(config: Dict[str, Any]) -> FileMonitorConfig:
     return FileMonitorConfig.from_dict(config.get("file_monitor"))
 
 
+def _load_web_search_config(config: Dict[str, Any]) -> WebSearchConfig:
+    """读取网络搜索配置节，缺失时返回默认禁用状态。"""
+    return WebSearchConfig.from_dict(config.get("web_search"))
+
+
 def _lock_path(config_file: Path) -> Path:
     """锁文件放在配置文件同目录，便于多项目并行时相互隔离。"""
     return config_file.parent / DEFAULT_LOCK_FILE
@@ -230,6 +237,7 @@ def main() -> None:
 
                 # OpenClaw 配置与健康检查
                 openclaw_cfg = _load_openclaw_config(raw_config)
+                web_search_cfg = _load_web_search_config(raw_config)
                 if openclaw_cfg.enabled:
                     healthy, health_msg = OpenClawClient.check_health(
                         cli_path=openclaw_cfg.cli_path
@@ -263,6 +271,20 @@ def main() -> None:
                 else:
                     openclaw_client = None
                     print("🤖 单引擎模式: LLM 秒回")
+                web_search_enabled = (
+                    openclaw_cfg.mode != "openclaw"
+                    and web_search_cfg.enabled
+                    and web_search_cfg.provider == "baidu"
+                    and bool(web_search_cfg.api_key)
+                )
+                print(
+                    "网络插件: "
+                    + (
+                        f"已启用（LLM 回复路径，baidu，引用 {web_search_cfg.count} 条，超时 {web_search_cfg.timeout:g} 秒）"
+                        if web_search_enabled
+                        else "未启用"
+                    )
+                )
                 print("启动中：只有被 @ 时才会调用大模型回复。按 Ctrl+C 停止。")
 
                 with WeChatClient(auto_connect=True) as wx:
@@ -271,6 +293,7 @@ def main() -> None:
                         context_size=ai_context_size,
                         reply_on_at=True,
                         max_reply_chars=ai_max_reply_chars,
+                        web_search=SearchAugmentor(web_search_cfg) if web_search_enabled else None,
                     )
                     # 文件监控（可选）
                     file_monitor_cfg = _load_file_monitor_config(raw_config)

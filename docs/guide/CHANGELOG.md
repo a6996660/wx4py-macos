@@ -7,6 +7,29 @@
 - `MINOR`：新增功能且保持兼容
 - `MAJOR`：存在破坏性变更
 
+## [macOS-only] - 2026-05-07
+
+### 新增
+
+- **Ollama Native API 支持**：Provider 新增 `api_format: "ollama"` 选项，可直接对接本地 Ollama `/api/chat` 原生接口（除 `completions` 之外的新选项），自动兼容 Ollama 的 `message.role = "assistant"` 和可选的 `options.temperature`。
+- **系统提示词（system_prompt）三层回退可配置化**：
+  - 支持在配置文件中配置全局 `system_prompt`，也可在每个 Provider 下独立配置。
+  - 回退优先级：Provider 级 → 全局级 → 代码内置默认提示词。
+  - 空字符串按未配置处理，回退优先级：Provider 级非空提示词 → 全局级非空提示词 → 代码内置默认提示词。
+  - Web 配置页面可直接编辑默认提示词，无需手动复制。
+- **联网搜索插件（百度 AI Search）**：新增 `web_search` 配置节，支持自动触发百度搜索并将检索结果注入 LLM 上下文。
+  - 自动检测：内置实时关键词库（天气、股价、新闻、油价等），命中后自动触发搜索。
+  - 手动模式：关闭 `auto_detect` 后所有消息都会尝试搜索。
+  - 支持配置搜索条数、超时、API Key 等。
+- **Thinking 模式可配置**：Ollama 模型（如 QwQ、DeepSeek-R1）支持通过 `enable_thinking: true/false` 显式控制思考参数；Ollama 会映射为原生 `think` 字段。
+- **日志补全**：`web_search` 和 `AIResponder` 中增加详细的调用链路日志，包括搜索判断、请求参数、返回结果数量、上下文注入等，便于排查联网插件是否生效。
+
+### 优化
+
+- 配置页面 UI 改进：删除"复制默认提示词"按钮，改为直接填充可编辑的文本域；新增联网搜索、Thinking 模式、Ollama 格式等配置项。
+- `AIConfig.from_file` 修复 Provider 空 `system_prompt` 覆盖内置默认提示词的问题，空字符串会继续回退。
+- `AIResponder.__call__` 中 `system_prompt` 参数使用 `is not None` 判断，避免空字符串被 `or` 跳过。
+
 ## [macOS-only] - 2026-05-06
 
 ### 新增

@@ -23,9 +23,12 @@ from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
 from .features.messaging.listener import MessageEvent
+from .utils.logger import get_logger
+from .web_search import SearchAugmentor
 
-ApiFormat = Literal["completions", "responses", "anthropic"]
+ApiFormat = Literal["completions", "responses", "anthropic", "ollama"]
 _MISSING = object()
+logger = get_logger(__name__)
 
 
 DEFAULT_SYSTEM_PROMPT = """你在微信群聊里回复消息，像一个靠谱、温和、有分寸的群友。
@@ -140,6 +143,7 @@ class AIConfig:
             raise ValueError(f"AI 配置文件 JSON 格式错误: {config_path}: {exc}") from exc
 
         selected_provider = provider or data.get("default")
+        global_system_prompt = data.get("system_prompt")
         if "providers" in data:
             providers = data.get("providers") or {}
             if not selected_provider:
@@ -153,12 +157,19 @@ class AIConfig:
                 raise ValueError(f"AI provider 不存在: {selected_provider}") from exc
 
         prefix = env_prefix or (str(selected_provider).upper() if selected_provider else "AI")
+        provider_system_prompt = _config_value(data, "system_prompt", prefix, default=None)
+        if isinstance(provider_system_prompt, str) and provider_system_prompt.strip():
+            system_prompt = provider_system_prompt
+        elif isinstance(global_system_prompt, str) and global_system_prompt.strip():
+            system_prompt = global_system_prompt
+        else:
+            system_prompt = DEFAULT_SYSTEM_PROMPT
         return cls(
             base_url=_config_value(data, "base_url", prefix),
             model=_config_value(data, "model", prefix),
             api_key=_config_value(data, "api_key", prefix),
             api_format=_config_value(data, "api_format", prefix, default="completions"),
-            system_prompt=_config_value(data, "system_prompt", prefix, default=DEFAULT_SYSTEM_PROMPT),
+            system_prompt=system_prompt,
             temperature=float(_config_value(data, "temperature", prefix, default=0.7)),
             max_tokens=int(_config_value(data, "max_tokens", prefix, default=300)),
             timeout=float(_config_value(data, "timeout", prefix, default=60.0)),
@@ -176,7 +187,7 @@ class AIClient:
 
     def chat(self, messages: List[dict], system_prompt: Optional[str] = None) -> str:
         """发送对话并返回文本回复。"""
-        request = self._build_request(messages, system_prompt or self.config.system_prompt)
+        request = self._build_request(messages, system_prompt if system_prompt is not None else self.config.system_prompt)
         headers = self._build_headers()
 
         http_request = urllib.request.Request(
@@ -249,6 +260,23 @@ class AIClient:
                 "temperature": self.config.temperature,
             }
 
+        if self.api_format == "ollama":
+            request = {
+                "model": self.config.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    *messages,
+                ],
+                "options": {
+                    "temperature": self.config.temperature,
+                    "num_predict": self.config.max_tokens,
+                },
+                "stream": False,
+            }
+            if self.config.enable_thinking is not None:
+                request["think"] = self.config.enable_thinking
+            return request
+
         raise ValueError(f"不支持的 api_format: {self.api_format}")
 
     def _build_headers(self) -> Dict[str, str]:
@@ -267,6 +295,9 @@ class AIClient:
             headers.pop("Authorization", None)
             headers["x-api-key"] = self.config.api_key
             headers["anthropic-version"] = "2023-06-01"
+
+        if self.api_format == "ollama":
+            headers.pop("Authorization", None)
 
         return headers
 
@@ -294,6 +325,9 @@ class AIClient:
                 if item.get("type") == "text" and item.get("text")
             )
 
+        if self.api_format == "ollama":
+            return data.get("message", {}).get("content", "")
+
         return ""
 
     def _format_http_error(self, status: int, body: str) -> str:
@@ -310,8 +344,8 @@ class AIClient:
     def _normalize_api_format(api_format: str) -> ApiFormat:
         if api_format == "response":
             return "responses"
-        if api_format not in {"completions", "responses", "anthropic"}:
-            raise ValueError("api_format must be one of: completions, responses, anthropic")
+        if api_format not in {"completions", "responses", "anthropic", "ollama"}:
+            raise ValueError("api_format must be one of: completions, responses, anthropic, ollama")
         return api_format  # type: ignore[return-value]
 
     @staticmethod
@@ -348,6 +382,16 @@ class AIClient:
                 return f"{normalized}/messages"
             return f"{normalized}/v1/messages"
 
+        if api_format == "ollama":
+            if AIClient._has_path_suffix(path, ["/api/chat"]):
+                return normalized
+            # 把 /v1 结尾的 base_url 转为 /api/chat
+            base = normalized
+            if base.endswith("/v1"):
+                base = base[:-3]
+            base = base.rstrip("/")
+            return f"{base}/api/chat"
+
         raise ValueError(f"不支持的 api_format: {api_format}")
 
     @staticmethod
@@ -377,11 +421,13 @@ class AIResponder:
         context_size: int = 8,
         reply_on_at: bool = True,
         max_reply_chars: int = 180,
+        web_search: Optional[SearchAugmentor] = None,
     ):
         self.client = client
         self.context_size = context_size
         self.reply_on_at = reply_on_at
         self.max_reply_chars = max(20, int(max_reply_chars))
+        self.web_search = web_search
         self.contexts: Dict[str, List[dict]] = {}
 
     def seed_context_from_group_logs(
@@ -408,20 +454,29 @@ class AIResponder:
                                 record = json.loads(line)
                             except json.JSONDecodeError:
                                 continue
-                            if record.get("event") != "received":
-                                continue
                             if record.get("group") != group:
                                 continue
-                            message = str(record.get("message") or "").strip()
-                            if not message:
-                                continue
-                            sender = str(record.get("sender") or "").strip()
-                            group_records.append(
-                                {
-                                    "role": "user",
-                                    "content": self._format_content(sender, message),
-                                }
-                            )
+                            event_type = record.get("event")
+                            if event_type == "received":
+                                message = str(record.get("message") or "").strip()
+                                if not message:
+                                    continue
+                                sender = str(record.get("sender") or "").strip()
+                                group_records.append(
+                                    {
+                                        "role": "user",
+                                        "content": self._format_content(sender, message),
+                                    }
+                                )
+                            elif event_type == "reply_sent":
+                                reply = str(record.get("reply") or "").strip()
+                                if reply:
+                                    group_records.append(
+                                        {
+                                            "role": "assistant",
+                                            "content": reply,
+                                        }
+                                    )
                 except OSError:
                     continue
 
@@ -443,18 +498,42 @@ class AIResponder:
         context_key = self._context_key(event)
         context = self.contexts.setdefault(context_key, [])
         current_message = {"role": "user", "content": self._format_user_content(event, raw_content)}
+        effective_max_reply_chars = self._effective_max_reply_chars(content)
         messages = [
-            self._build_group_scope_message(event, self.max_reply_chars),
+            self._build_group_scope_message(event, effective_max_reply_chars),
             *context[-self.context_size:],
             current_message,
         ]
+        search_context = None
+        reply_system_prompt = None
+        if self.web_search is not None and self.web_search.config.enabled:
+            search_context = self.web_search.augment(
+                content,
+                messages=messages[:-1],
+                llm_client=self.client,
+                scope=context_key,
+            )
+            if search_context:
+                messages = [
+                    self._build_group_scope_message(event, effective_max_reply_chars),
+                    search_context,
+                    current_message,
+                ]
+                reply_system_prompt = self._web_search_reply_system_prompt()
+                logger.info("联网搜索上下文已注入: query=%s context_len=%d", content[:80], len(search_context.get("content", "")))
+            else:
+                logger.info("联网搜索未返回上下文: query=%s", content[:80])
+        else:
+            logger.debug("联网搜索未启用: web_search=None")
 
         reply = self._sanitize_reply(
-            self.client.chat(messages),
+            self.client.chat(messages, system_prompt=reply_system_prompt),
             group_nickname=event.group_nickname,
-            max_chars=self.max_reply_chars,
+            max_chars=effective_max_reply_chars,
         )
         if reply:
+            if search_context and self.web_search is not None and self.web_search.config.enabled:
+                self.web_search.remember_reply(context_key, reply)
             context.append(current_message)
             context.append({"role": "assistant", "content": reply})
             del context[:-self.context_size]
@@ -499,6 +578,25 @@ class AIResponder:
         safe = safe.strip(" .")
         return safe or "未命名群聊"
 
+    def _effective_max_reply_chars(self, content: str) -> int:
+        text = str(content or "").lower().replace(" ", "")
+        if any(keyword in text for keyword in ("前十", "top10", "热搜", "榜单")):
+            return max(self.max_reply_chars, 520)
+        if any(keyword in text for keyword in ("新闻", "大事")):
+            return max(self.max_reply_chars, 360)
+        return self.max_reply_chars
+
+    @staticmethod
+    def _web_search_reply_system_prompt() -> str:
+        return (
+            "你是搜索结果转写器。当前用户问题已经完成联网检索，"
+            "你的回复必须完全来自提供的搜索结果或本机时间上下文。"
+            "不要补充外部知识，不要推理搜索结果没有写出的事实，不要改写成新的结论。"
+            "只做去 Markdown、去链接噪音、合并重复、裁剪长度、微信聊天化表达。"
+            "如果原结果已有排名、标题、数值、日期或热度，尽量原样保留。"
+            "如果结果没有直接答案，就说结果里没看到准确信息。"
+        )
+
     @staticmethod
     def _build_group_scope_message(event: MessageEvent, max_reply_chars: int = 180) -> dict:
         nickname = event.group_nickname or "当前登录账号"
@@ -528,8 +626,9 @@ class AIResponder:
     @staticmethod
     def _sanitize_reply(text: str, group_nickname: Optional[str] = None, max_chars: int = 180) -> str:
         """清理模型偶发的 Markdown 痕迹，让回复更像微信文本。"""
+        text = AIResponder._split_inline_numbered_items(str(text or ""))
         lines = []
-        for raw_line in str(text or "").splitlines():
+        for raw_line in text.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
@@ -537,10 +636,11 @@ class AIResponder:
             for prefix in ("- ", "* ", "• "):
                 if line.startswith(prefix):
                     line = line[len(prefix):].strip()
-            if len(line) > 2 and line[0].isdigit() and line[1] in {".", "、"}:
-                line = line[2:].strip()
             lines.append(line)
-        reply = " ".join(lines).strip()
+        if any(re.match(r"^\d+[\.\、]", line) for line in lines):
+            reply = "\n".join(lines).strip()
+        else:
+            reply = " ".join(lines).strip()
         reply = reply.replace("**", "").replace("__", "").replace("`", "")
         if group_nickname:
             reply = (
@@ -555,6 +655,12 @@ class AIResponder:
         if max_chars > 0 and len(reply) > max_chars:
             reply = AIResponder._trim_at_sentence_boundary(reply, max_chars)
         return reply.strip()
+
+    @staticmethod
+    def _split_inline_numbered_items(text: str) -> str:
+        """把模型挤在一行里的 1. 2. 3. 榜单拆成多行。"""
+        text = str(text or "")
+        return re.sub(r"(?<!\n)\s+(?=\d{1,2}[\.\、]\s)", "\n", text)
 
     @staticmethod
     def _trim_at_sentence_boundary(text: str, max_chars: int) -> str:

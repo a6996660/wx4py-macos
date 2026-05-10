@@ -37,6 +37,9 @@ input.error+.error-text,textarea.error+.error-text,.form-group:has(input.error) 
 .tag button{border:none;background:none;color:var(--primary);cursor:pointer;font-size:1rem;line-height:1;padding:0 2px}
 .checkbox{display:flex;align-items:center;gap:8px;cursor:pointer}
 .checkbox input{width:auto}
+.range-row{display:grid;grid-template-columns:1fr 120px;gap:16px;align-items:center}
+.range-row input[type=range]{padding:0}
+.switch-row{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
 .mode-options{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
 .mode-option{display:flex;gap:10px;padding:12px;border:1px solid var(--border);border-radius:8px;cursor:pointer;background:#fff;min-height:92px}
 .mode-option:has(input:checked){border-color:var(--primary);background:var(--primary-light);box-shadow:0 0 0 1px rgba(79,68,229,.18)}
@@ -185,6 +188,64 @@ input.error+.error-text,textarea.error+.error-text,.form-group:has(input.error) 
           <label>单条回复最大字符数</label>
           <input type="number" id="aiMaxReplyChars" min="20" />
           <p class="error-text" id="err-aiMaxReplyChars"></p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="section-title">默认系统提示词</div>
+        <div class="form-group">
+          <label>全局默认提示词（Provider 未自定义时生效）</label>
+          <textarea id="systemPrompt" rows="10" style="font-size:.82rem;resize:vertical;"></textarea>
+          <p class="hint">默认已填入内置提示词，可直接编辑。清空后保存，将回退使用代码内置默认提示词。</p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="section-title">网络插件</div>
+        <div class="form-group">
+          <div class="switch-row">
+            <label class="checkbox" style="margin-bottom:0">
+              <input type="checkbox" id="wsEnabled" />
+              <span>启用网络插件</span>
+            </label>
+            <label class="checkbox" style="margin-bottom:0">
+              <input type="checkbox" id="wsAutoDetect" />
+              <span>自动判断是否搜索</span>
+            </label>
+          </div>
+          <p class="hint">仅 LLM 回复路径生效；仅 LLM 模式和双引擎的普通消息可用，OpenClaw 路径不使用。</p>
+          <p class="error-text" id="err-wsEnabled"></p>
+        </div>
+        <div id="wsBody">
+          <div class="row">
+            <div class="form-group">
+              <label>搜索引擎</label>
+              <select id="wsProvider">
+                <option value="baidu">百度 AI Search</option>
+              </select>
+              <p class="error-text" id="err-wsProvider"></p>
+            </div>
+            <div class="form-group">
+              <label>超时（秒）</label>
+              <input type="number" id="wsTimeout" min="1" step="1" />
+              <p class="error-text" id="err-wsTimeout"></p>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>百度 API Key</label>
+            <div class="pwd-wrap">
+              <input type="password" id="wsApiKey" autocomplete="off" placeholder="留空时读取环境变量 BAIDU_API_KEY" />
+              <button type="button" class="eye-btn" onclick="togglePwd(this)" title="显示/隐藏">&#128065;</button>
+            </div>
+            <p class="hint">需要百度千帆 AI Search API Key；不建议提交真实 Key。</p>
+            <p class="error-text" id="err-wsApiKey"></p>
+          </div>
+          <div class="form-group">
+            <label>引用条数</label>
+            <div class="range-row">
+              <input type="range" id="wsCountRange" min="1" max="50" step="1" />
+              <input type="number" id="wsCount" min="1" max="50" step="1" />
+            </div>
+            <p class="error-text" id="err-wsCount"></p>
+          </div>
         </div>
       </div>
       <div class="card">
@@ -389,6 +450,7 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+
 /* ---------- Tag Input ---------- */
 function createTagInput(el, values) {
   const input = el.querySelector('input');
@@ -417,18 +479,23 @@ const groupsTags = createTagInput(document.getElementById('groupsInput'), []);
 const ocPrefixesTags = createTagInput(document.getElementById('ocPrefixesInput'), []);
 const ocResetCommandsTags = createTagInput(document.getElementById('ocResetCommandsInput'), []);
 const fmWatchDirsTags = createTagInput(document.getElementById('fmWatchDirsInput'), []);
+const wsCountInput = document.getElementById('wsCount');
+const wsCountRange = document.getElementById('wsCountRange');
+wsCountInput.addEventListener('input', () => { wsCountRange.value = wsCountInput.value || 5; });
+wsCountRange.addEventListener('input', () => { wsCountInput.value = wsCountRange.value; });
 
 /* ---------- Providers ---------- */
 let providerCounter = 0;
 const providerFields = [
   {k:'base_url',l:'Base URL',t:'text',r:1},
-  {k:'api_format',l:'API 格式',t:'select',opts:[['completions','completions (OpenAI-compatible)'],['responses','responses (OpenAI Responses)'],['anthropic','anthropic (Claude)']]},
+  {k:'api_format',l:'API 格式',t:'select',opts:[['completions','completions (OpenAI-compatible)'],['responses','responses (OpenAI Responses)'],['anthropic','anthropic (Claude)'],['ollama','ollama (Ollama Native)']]},
   {k:'model',l:'模型',t:'text',r:1},
   {k:'api_key',l:'API Key',t:'password',r:1},
   {k:'temperature',l:'Temperature',t:'number',attr:'step=0.01 min=0 max=2'},
   {k:'max_tokens',l:'Max Tokens',t:'number',attr:'min=1'},
   {k:'timeout',l:'超时（秒）',t:'number',attr:'min=1'},
-  {k:'enable_thinking',l:'Thinking',t:'select',opts:[['','自动（默认）'],['true','启用'],['false','禁用']]}
+  {k:'enable_thinking',l:'Thinking',t:'select',opts:[['','自动（默认）'],['true','启用'],['false','禁用']]},
+  {k:'system_prompt',l:'系统提示词',t:'textarea',attr:'rows=6 placeholder="留空继承默认提示词"'}
 ];
 
 function buildProviderHTML(id, name, data) {
@@ -439,6 +506,10 @@ function buildProviderHTML(id, name, data) {
       return `<div class="form-group"><label>${esc(f.l)}</label><select class="pf" data-k="${esc(f.k)}">${opts}</select></div>`;
     }
     const hasVal = val !== null && val !== undefined;
+    if (f.t === 'textarea') {
+      const attr = f.attr || '';
+      return `<div class="form-group"><label>${esc(f.l)}</label><textarea class="pf" data-k="${esc(f.k)}" ${attr}>${esc(hasVal ? val : '')}</textarea></div>`;
+    }
     const attr = (f.attr || '') + ` value="${esc(hasVal ? val : '')}"`;
     if (f.t === 'password') {
       return `<div class="form-group"><label>${esc(f.l)}</label><div class="pwd-wrap"><input type="password" class="pf" data-k="${esc(f.k)}" ${attr} ${f.r?'required':''} /><button type="button" class="eye-btn" onclick="togglePwd(this)" title="显示/隐藏">&#128065;</button></div></div>`;
@@ -505,8 +576,18 @@ function loadConfig(cfg) {
   document.getElementById('aiQueueSize').value = cfg.ai_queue_size ?? 0;
   document.getElementById('aiContextSize').value = cfg.ai_context_size ?? 8;
   document.getElementById('aiMaxReplyChars').value = cfg.ai_max_reply_chars ?? 180;
+  document.getElementById('systemPrompt').value = cfg.system_prompt || (window.__DEFAULT_SYSTEM_PROMPT__ || '');
   document.getElementById('groupLogRoot').value = cfg.group_log_root ?? 'logs/group_mentions';
   document.getElementById('errorLogRoot').value = cfg.error_log_root ?? 'logs/errors';
+  const ws = cfg.web_search || {};
+  document.getElementById('wsEnabled').checked = !!ws.enabled;
+  document.getElementById('wsProvider').value = ws.provider ?? 'baidu';
+  document.getElementById('wsApiKey').value = ws.api_key ?? '';
+  document.getElementById('wsTimeout').value = ws.timeout ?? 10;
+  document.getElementById('wsAutoDetect').checked = ws.auto_detect !== false;
+  document.getElementById('wsCount').value = ws.count ?? 5;
+  document.getElementById('wsCountRange').value = ws.count ?? 5;
+  toggleWsBody();
 
   document.getElementById('providersContainer').innerHTML = '';
   const providers = cfg.providers || {};
@@ -556,6 +637,7 @@ function collectConfig() {
       const k = el.dataset.k;
       if (el.type === 'number') v = v === '' ? null : (v.includes('.') ? parseFloat(v) : parseInt(v,10));
       if (k === 'enable_thinking') v = v === '' ? null : (v === 'true' ? true : false);
+      if (k === 'system_prompt' && v === '') v = null;
       if (v !== null && v !== undefined) data[k] = v;
     });
     providers[name] = data;
@@ -591,6 +673,14 @@ function collectConfig() {
     max_age_seconds: parseFloat(document.getElementById('fmMaxAge').value) || 600,
     auto_discover: document.getElementById('fmAutoDiscover').checked,
   };
+  const web_search = {
+    enabled: document.getElementById('wsEnabled').checked,
+    provider: document.getElementById('wsProvider').value || 'baidu',
+    api_key: document.getElementById('wsApiKey').value.trim(),
+    count: safeInt(document.getElementById('wsCount').value),
+    timeout: safeFloat(document.getElementById('wsTimeout').value),
+    auto_detect: document.getElementById('wsAutoDetect').checked,
+  };
 
   function safeFloat(v) { const n = parseFloat(v); return isNaN(n) ? v : n; }
   function safeInt(v) { const n = parseInt(v, 10); return isNaN(n) ? v : n; }
@@ -615,8 +705,10 @@ function collectConfig() {
     ai_queue_size: safeInt(document.getElementById('aiQueueSize').value),
     ai_context_size: safeInt(document.getElementById('aiContextSize').value),
     ai_max_reply_chars: safeInt(document.getElementById('aiMaxReplyChars').value),
+    system_prompt: document.getElementById('systemPrompt').value.trim(),
     group_log_root: document.getElementById('groupLogRoot').value.trim() || 'logs/group_mentions',
     error_log_root: document.getElementById('errorLogRoot').value.trim() || 'logs/errors',
+    web_search,
     default: document.getElementById('defaultProvider').value.trim(),
     providers,
     openclaw: oc,
@@ -651,6 +743,13 @@ function toggleFmBody() {
 }
 document.getElementById('fmEnabled').addEventListener('change', toggleFmBody);
 
+function toggleWsBody() {
+  const on = document.getElementById('wsEnabled').checked;
+  document.getElementById('wsBody').style.opacity = on ? '1' : '0.5';
+  document.getElementById('wsBody').style.pointerEvents = on ? 'auto' : 'none';
+}
+document.getElementById('wsEnabled').addEventListener('change', toggleWsBody);
+
 function showToast(msg, type) {
   const t = document.getElementById('toast');
   t.textContent = msg;
@@ -671,6 +770,9 @@ function showFieldErrors(errors) {
     'reply_delay_range':'delayMin','ai_queue_size':'aiQueueSize',
     'ai_context_size':'aiContextSize','ai_max_reply_chars':'aiMaxReplyChars',
     'default':'defaultProvider','providers':'providersContainer',
+    'web_search.enabled':'wsEnabled','web_search.provider':'wsProvider',
+    'web_search.api_key':'wsApiKey','web_search.count':'wsCount',
+    'web_search.timeout':'wsTimeout','web_search.auto_detect':'wsAutoDetect',
     'openclaw.timeout':'ocTimeout','openclaw.prefixes':'ocPrefixesInput',
     'openclaw.gateway_port':'ocGatewayPort','openclaw.gateway_url':'ocGatewayUrl'
   };

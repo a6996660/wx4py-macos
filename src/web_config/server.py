@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
+from ..ai import DEFAULT_SYSTEM_PROMPT
+
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "_说明": "wx4py AI 群聊机器人配置",
@@ -26,8 +28,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "ai_queue_size": 0,
     "ai_context_size": 8,
     "ai_max_reply_chars": 180,
+    "system_prompt": "",
     "group_log_root": "logs/group_mentions",
     "error_log_root": "logs/errors",
+    "web_search": {
+        "enabled": False,
+        "provider": "baidu",
+        "api_key": "",
+        "count": 5,
+        "timeout": 10,
+        "auto_detect": True,
+    },
     "default": "",
     "providers": {},
     "openclaw": {
@@ -162,6 +173,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
             "<script>"
             f"window.__CONFIG_TOKEN__ = {json.dumps(self._token)};"
             f"window.__INITIAL_CONFIG__ = {json.dumps(current_config, ensure_ascii=False)};"
+            f"window.__DEFAULT_SYSTEM_PROMPT__ = {json.dumps(DEFAULT_SYSTEM_PROMPT, ensure_ascii=False)};"
             "</script>"
         )
         html = html.replace("</head>", inject + "</head>")
@@ -269,6 +281,28 @@ def _validate_config(data: Dict[str, Any]) -> Dict[str, str]:
     ai_max_reply_chars = data.get("ai_max_reply_chars")
     if not isinstance(ai_max_reply_chars, int) or ai_max_reply_chars < 20:
         errors["ai_max_reply_chars"] = "必须是不小于 20 的整数"
+
+    web_search = data.get("web_search")
+    if web_search is not None:
+        if not isinstance(web_search, dict):
+            errors["web_search"] = "网络插件配置必须是对象"
+        else:
+            provider = str(web_search.get("provider", "baidu") or "").strip().lower()
+            if provider != "baidu":
+                errors["web_search.provider"] = "网络插件 provider 目前只支持 baidu"
+            if not isinstance(web_search.get("enabled", False), bool):
+                errors["web_search.enabled"] = "网络插件开关必须是布尔值"
+            if not isinstance(web_search.get("auto_detect", True), bool):
+                errors["web_search.auto_detect"] = "自动判断开关必须是布尔值"
+            api_key = web_search.get("api_key", "")
+            if api_key is not None and not isinstance(api_key, str):
+                errors["web_search.api_key"] = "百度 API Key 必须是文本"
+            count = web_search.get("count", 5)
+            if not isinstance(count, int) or count < 1 or count > 50:
+                errors["web_search.count"] = "引用条数必须是 1-50 的整数"
+            timeout = web_search.get("timeout", 10)
+            if not isinstance(timeout, (int, float)) or timeout <= 0:
+                errors["web_search.timeout"] = "搜索超时必须大于 0"
 
     providers = data.get("providers")
     if not isinstance(providers, dict) or not providers:

@@ -8,6 +8,7 @@ wx4py - Python 微信自动化工具
 from ._version import __version__
 from .ai import AIClient, AIConfig, AIResponder
 from .client import WeChatClient
+from .web_search import BaiduWebSearchClient, SearchAugmentor, WebSearchConfig
 from .openclaw_client import (
     HybridResponder,
     OpenClawClient,
@@ -50,6 +51,9 @@ __all__ = [
     "AIClient",
     "AIConfig",
     "AIResponder",
+    "WebSearchConfig",
+    "BaiduWebSearchClient",
+    "SearchAugmentor",
     "OpenClawClient",
     "OpenClawConfig",
     "OpenClawResult",

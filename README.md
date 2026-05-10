@@ -16,7 +16,7 @@
 
 - 只监听配置文件中的群聊白名单，避免误处理其他群。
 - 只在群消息 @ 当前登录微信昵称时触发，日常聊天不会调用模型。
-- 支持 OpenAI-compatible API，例如火山引擎 Ark Bots、OpenAI 兼容服务等。
+- 支持 OpenAI-compatible API（`completions` 格式）和 **Ollama Native API**（`ollama` 格式），可接入火山引擎 Ark、OpenAI 兼容服务或本地 Ollama 模型。
 - 多群消息进入同一个串行队列，逐条生成、逐条切群发送，降低焦点抢占和串群风险。
 - 按群隔离上下文，并从 `logs/group_mentions` 恢复最近对话，重启后仍保留短期记忆。
 - 自动回复前支持随机延迟，让回复节奏更接近真人聊天。
@@ -148,7 +148,20 @@ cp wx4py_ai_config.example.json wx4py_ai_config.json
       "api_key": "replace-with-your-api-key",
       "temperature": 0.7,
       "max_tokens": 220,
-      "timeout": 20
+      "timeout": 20,
+      "enable_thinking": false,
+      "system_prompt": ""
+    },
+    "qwen3-4b": {
+      "base_url": "http://127.0.0.1:11434",
+      "api_format": "ollama",
+      "model": "qwen3:4b",
+      "api_key": "ollama",
+      "temperature": 0.7,
+      "max_tokens": 220,
+      "timeout": 120,
+      "enable_thinking": false,
+      "system_prompt": ""
     }
   }
 }
@@ -161,7 +174,10 @@ cp wx4py_ai_config.example.json wx4py_ai_config.json
 - `ai_context_size`：同一个群带给模型的最近上下文条数。
 - `ai_max_reply_chars`：单条回复目标长度，建议控制在 80-220。
 - `default`：默认使用 `providers` 中的哪一个服务。
-- `providers`：OpenAI-compatible 模型服务配置。
+- `providers`：模型服务配置，支持 `completions`（OpenAI-compatible）和 `ollama`（Ollama Native）两种格式。
+  - `api_format`：`"completions"` 或 `"ollama"`。Ollama 使用原生 `/api/chat` 接口。
+  - `enable_thinking`：是否显式开启或关闭模型思考参数；Ollama 会映射为原生 `think` 字段。
+  - `system_prompt`：Provider 级系统提示词。填写后覆盖全局提示词；留空或不填则回退到全局 `system_prompt` 或代码内置默认。
 
 ### 4. 启动机器人
 
@@ -230,6 +246,30 @@ OpenClaw Gateway 默认按本机部署处理，即 `ws://127.0.0.1:18789`。如�
 }
 ```
 
+### 6. 可选：启用联网搜索
+
+在 `wx4py_ai_config.json` 中打开 `web_search`，让机器人在回答天气、股价、新闻等实时信息类问题时自动调用百度搜索：
+
+```json
+{
+  "web_search": {
+    "enabled": true,
+    "api_key": "your-baidu-appbuilder-api-key",
+    "auto_detect": true,
+    "count": 5,
+    "timeout": 15
+  }
+}
+```
+
+- `enabled`：是否启用联网搜索。
+- `api_key`：百度 AppBuilder API Key，用于调用百度搜索。
+- `auto_detect`：`true` 时只针对实时关键词（天气、股价、新闻等）触发搜索；`false` 时所有消息都会尝试搜索。
+- `count`：每次搜索返回的网页结果数量。
+- `timeout`：搜索请求超时秒数。
+
+搜索上下文会自动注入到 LLM 的 system 消息中，无需额外配置提示词。
+
 ## 推荐验证
 
 第一次接入建议按这个顺序验证：
@@ -274,6 +314,7 @@ with WeChatClient(auto_connect=True) as wx:
 
 ## 精简更新日志
 
+- **2026-05-07**：新增 Ollama Native API 支持；系统提示词支持三层回退可配置化；新增百度 AI Search 联网插件；Thinking 模式可配置；配置页面支持直接编辑默认提示词、联网搜索和 Ollama 选项。
 - **2026-05-06**：完善 OpenClaw 文件引用与回传链路。支持解析微信引用文件、传给 OpenClaw、识别生成文件并自动发送；修复旧附件误继承、输入文件被误发、中文标点后文件名无法解析等问题。
 - **2026-05-03**：新增 OpenClaw 双引擎模式。普通 @ 消息走 LLM，带 `/claw` 等前缀的消息走本地 OpenClaw agent；新增引用消息识别、按群 session 隔离、失败降级和切群稳定性优化。
 - **2026-05-02**：项目主线调整为 macOS-only 微信群 @ AI 自动回复机器人。移除 Windows 后端，新增左侧会话列表监听、串行回复队列、按群上下文、审计日志和关键错误日志。
